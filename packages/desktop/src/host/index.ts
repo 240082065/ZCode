@@ -14,6 +14,7 @@
  * 3. 后续远端 connect / scoped attachment 都由同一 Host 处理
  */
 import { createHostDatabaseStartup } from "./hostDatabaseStartup.js";
+import { startScriptBridge } from "./scriptBridge.js";
 import { randomUUID } from "node:crypto";
 import {
   MessagePortProtocol,
@@ -2894,6 +2895,7 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
           );
           services.register(IZCodeTaskService, reportingZCodeTaskService);
         }
+        startScriptBridge(services);
         wireLocalResourceTelemetry(services);
         hasDisposedHostResources = false;
         disposeHostResourcesInFlight = null;
