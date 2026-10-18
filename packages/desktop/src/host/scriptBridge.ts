@@ -163,8 +163,30 @@ async function handleRequest(
       };
       const workspacePath = params.workspacePath ?? taskWorkspacePaths.get(params.taskId);
       if (workspacePath !== undefined) subscribeTaskEvents(taskService, params.taskId, workspacePath);
-      await taskService.sendPrompt(params);
+      try {
+        await taskService.sendPrompt(params);
+      } catch (error) {
+        // 已存盘但还没载入运行时的旧任务：桌面端界面打开它时会先恢复；这里同样先恢复再重发一次。
+        const notLoaded = error instanceof Error && error.message.includes("sessionNotFound");
+        if (!notLoaded || workspacePath === undefined) throw error;
+        await taskService.resumeTask({ taskId: params.taskId, workspacePath });
+        taskWorkspacePaths.set(params.taskId, workspacePath);
+        await taskService.sendPrompt(params);
+      }
       writeJson(res, 200, { ok: true });
+      return;
+    }
+    if (action === "resume") {
+      const params = payload as { taskId: string; workspacePath?: string };
+      const workspacePath = params.workspacePath ?? taskWorkspacePaths.get(params.taskId);
+      if (workspacePath === undefined) {
+        writeJson(res, 400, { error: "unknown taskId, pass workspacePath explicitly" });
+        return;
+      }
+      const meta = await taskService.resumeTask({ taskId: params.taskId, workspacePath });
+      taskWorkspacePaths.set(params.taskId, workspacePath);
+      subscribeTaskEvents(taskService, params.taskId, workspacePath);
+      writeJson(res, 200, { ok: true, result: meta });
       return;
     }
     if (action === "cancel") {
