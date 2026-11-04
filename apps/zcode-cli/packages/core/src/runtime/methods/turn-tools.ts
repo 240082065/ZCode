@@ -1,13 +1,17 @@
+import type { ToolSearchExecutionContext } from "@zcode/contracts";
 import { createPartId, TurnMachineImpl } from "../deps.js";
 import type {
   MessageId,
-  ModelToolCall,
   ToolCallId,
   TraceContext,
   ToolCall,
   ToolExecutionResult,
 } from "../deps.js";
-import { emitStreamingToolLedgerUpdate, toRecordInput } from "../helpers/index.js";
+import {
+  emitStreamingToolLedgerUpdate,
+  throwIfTurnAborted,
+  toRecordInput,
+} from "../helpers/index.js";
 import type { RuntimeModelTextResult, StreamedToolExecutionResult } from "../types.js";
 import type { AgentRuntimeInternal } from "../internal.js";
 import { emitSyntheticStreamedToolError } from "./streaming-tool-synthetic-result.js";
@@ -25,18 +29,21 @@ import {
   isOffPeakCreateRestrictedTurn,
   recordCompletedToolBatch,
 } from "./turn-loop-state.js";
+import type { ToolCallInput } from "../../agent/message-history.js";
 import { settleToolResults, type ToolResultPart } from "./tool-result-settlement.js";
+import { withUserStoppedToolResultContent } from "./interrupt-marker.js";
 
 export async function executeToolCallsForModelStep(
   this: AgentRuntimeInternal,
   state: RegularTurnLoopState,
   options: {
+    toolSearch?: ToolSearchExecutionContext;
     assistantCreatedAt: number;
     assistantMessageId: MessageId;
     modelTraceContext: TraceContext;
     result: RuntimeModelTextResult;
     streamedToolResults?: StreamedToolExecutionResult[];
-    toolCalls: ModelToolCall[];
+    toolCalls: ToolCallInput[];
   },
 ): Promise<"continue" | "break"> {
   const model = state.model;
@@ -49,6 +56,7 @@ export async function executeToolCallsForModelStep(
     // 让 executor 强制走 registry miss，而不是把 storage 占位值当成真实工具。
     name: tc.name,
     input: tc.input,
+    ...(tc.modelCallWrapper ? { modelCallWrapper: tc.modelCallWrapper } : {}),
   }));
   const streamedResultsById = new Map(
     (options.streamedToolResults ?? []).map((entry) => [entry.toolCallId, entry]),
@@ -157,11 +165,13 @@ export async function executeToolCallsForModelStep(
     });
     const execution = await this.executeTools(pendingToolCalls, pendingSchedule, {
       automationTurn: isAutomationMutationRestrictedTurn(state),
+      automationId: state.automationId,
       offPeakTurn: isOffPeakCreateRestrictedTurn(state),
       signal: state.turnAbortSignal,
       traceContext: options.modelTraceContext,
       subagentModelOverride: state.subagentModelOverride,
       model: state.model,
+      toolSearch: options.toolSearch,
       onBatchStart: async (toolCallIds) => {
         // 已取消的 batch 仍由 executor 返回 cancelled results，但不能把从未进入
         // handler 的 tool parts 误标记为 running。
@@ -182,7 +192,12 @@ export async function executeToolCallsForModelStep(
               callID: toolCall.id,
               declarationIndex: persisted.declarationIndex,
               tool: projectedToolName.toolName,
-              metadata: projectedToolName.metadata,
+              metadata: {
+                ...projectedToolName.metadata,
+                ...(toolCall.modelCallWrapper
+                  ? { modelCallWrapper: toolCall.modelCallWrapper }
+                  : {}),
+              },
               state: {
                 status: "running",
                 input: persisted.input,
@@ -217,18 +232,34 @@ export async function executeToolCallsForModelStep(
   for (const pending of pendingExecutionResults) {
     resultById.set(pending.toolCallId, pending);
   }
-  const results = coreToolCalls
-    .map((toolCall) => resultById.get(toolCall.id))
-    .filter((result): result is ToolExecutionResult => result !== undefined);
-  await settleToolResults.call(this, state, {
-    assistantMessageId: options.assistantMessageId,
-    modelTraceContext: options.modelTraceContext,
-    results,
-    toolParts,
-    toolCallById,
-    streamedResultsById,
-  });
-
+  const results = withUserStoppedToolResultContent(
+    this,
+    state,
+    coreToolCalls
+      .map((toolCall) => resultById.get(toolCall.id))
+      .filter((result): result is ToolExecutionResult => result !== undefined),
+  );
+  try {
+    await settleToolResults.call(this, state, {
+      assistantMessageId: options.assistantMessageId,
+      modelTraceContext: options.modelTraceContext,
+      results,
+      toolParts,
+      toolCallById,
+      streamedResultsById,
+    });
+  } finally {
+    // 工具执行中停止：中断标记用工具阶段的文字。
+    // 修复原因：checkpoint 被取消时，结算写完结果后自己抛出取消，走不到下面的分支，
+    // 标记会用成模型请求阶段的文字。
+    if (state.turnAbortSignal.aborted) state.interruptedDuringToolBatch = true;
+  }
+  // 工具执行中停止：结算后直接结束本轮。
+  // 修复原因：继续往下会把挂起的 guide drain 进已停止的轮次；结束后 guide 由取消路径退回队列。
+  if (state.turnAbortSignal.aborted) {
+    await persistToolModelStepFinish(this, state, options);
+    throwIfTurnAborted(state.turnAbortSignal);
+  }
 
   const stopTurnResult = results.find((result) => result.turnControl?.stopTurnAfterResult === true);
   if (stopTurnResult) {
@@ -288,4 +319,3 @@ export async function executeToolCallsForModelStep(
   });
   return "continue";
 }
-

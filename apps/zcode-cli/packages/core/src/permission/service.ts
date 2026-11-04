@@ -230,6 +230,25 @@ export class PermissionService {
       );
     }
 
+    // 根因：needsApproval=false 不会越过 build/edit 对 workspace 副作用的通用询问，
+    // 导致无人值守的 automation 执行轮停在审批界面。该工具无模型可控 id，只能暂停
+    // Host 为本轮注入且用户可恢复的任务；显式 project deny/ask 与 plan 限制已在上方处理。
+    if (
+      context.toolName === "CronPauseSelf" &&
+      capability.permissionName === "automation.pause" &&
+      capability.sideEffectScope === "workspace" &&
+      capability.riskLevel === "low" &&
+      !capability.destructive &&
+      !capability.needsApproval
+    ) {
+      return this.allow(
+        context,
+        capability,
+        "tool.automationPauseSelf.preapproved",
+        "The current automation run may pause only its own automation",
+      );
+    }
+
     // workflow 草稿免确认：
     // 与 WebFetch 预批同一位次——排在 plan 分支之后，因为 plan 模式必须继续拦下一切写入，
     // 草稿也是写入；也排在项目 deny / ask 之后，项目规则照样压得过它。判定本身见
@@ -406,7 +425,7 @@ export class PermissionService {
       );
     }
     // 修订免确认：AmendWorkflow 的前驱是
-    // **本会话发起**的 run、且不是用户亲手停下的，即放行。与会话规则同位——阻断分支之后、ask 之前，
+    // **本会话发起**的 run、不是用户亲手停下的、且这次修订没有引入新 provider，即放行。与会话规则同位——阻断分支之后、ask 之前，
     // 不看模式。事实来自 resolveInput 回填的 `predecessor`（journal 的 parent_session_id / stopReason），
     // 不是内存表：重启、冷恢复后依然成立，也没有可播种、可撤销的东西。别的会话的 run、用户停过的
     // run 照常 ask：钥匙是 run 的归属，不是字段的在场。

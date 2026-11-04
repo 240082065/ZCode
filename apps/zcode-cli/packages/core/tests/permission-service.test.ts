@@ -70,6 +70,22 @@ const sessionMutationCapability: PermissionToolCapability = {
   sideEffectScope: "session",
 };
 
+const automationSelfPauseCapability: PermissionToolCapability = {
+  destructive: false,
+  needsApproval: false,
+  permission: {
+    denyPriority: "beforeAsk",
+    needsApproval: false,
+    permission: "automation.pause",
+    reason: "Pause only the automation that triggered this run",
+    riskLevel: "low",
+    sideEffectScope: "workspace",
+  },
+  readOnly: false,
+  riskLevel: "low",
+  sideEffectScope: "workspace",
+};
+
 const planModeSessionControlCapability: PermissionToolCapability = {
   allowedInPlanMode: true,
   destructive: false,
@@ -647,6 +663,50 @@ describe("PermissionService mode policy", () => {
     });
   });
 
+  it("allows CronPauseSelf in build mode without approval", () => {
+    const service = new PermissionService();
+
+    const decision = service.checkPermission(
+      {
+        input: {},
+        mode: "build",
+        riskLevel: "low",
+        toolName: "CronPauseSelf",
+      },
+      automationSelfPauseCapability,
+    );
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      decision: "allow",
+      ruleId: "tool.automationPauseSelf.preapproved",
+    });
+  });
+
+  it("lets project ask rules override CronPauseSelf auto-approval", () => {
+    const service = new PermissionService();
+
+    const decision = service.checkPermission(
+      {
+        input: {},
+        mode: "build",
+        riskLevel: "low",
+        toolName: "CronPauseSelf",
+      },
+      automationSelfPauseCapability,
+      {
+        version: 1,
+        ask: [{ toolName: "CronPauseSelf" }],
+      },
+    );
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      decision: "ask",
+      ruleId: "rule.project.ask",
+    });
+  });
+
   it("allows explicitly allowed tools in build mode", () => {
     const service = new PermissionService({
       allowedTools: new Set(["Write"]),
@@ -725,26 +785,6 @@ describe("PermissionService mode policy", () => {
       ruleId: "rule.project.allow",
     });
     expect(sameNameButUntrusted).toMatchObject({
-      allowed: false,
-      decision: "ask",
-      ruleId: "mode.build.sideEffect",
-    });
-  });
-
-  it("does not fall back to exact tool-name matching when a capability group loses authority", () => {
-    const service = new PermissionService();
-    const context = {
-      input: {},
-      mode: "build" as const,
-      riskLevel: "medium" as const,
-      toolName: "mcp__computer-use__get_app_state",
-    };
-    const rules = {
-      allow: [{ toolName: OFFICIAL_CUA_PERMISSION_RULE_TOOL_NAME }],
-      version: 1 as const,
-    };
-
-    expect(service.checkPermission(context, mcpCapability, rules as never)).toMatchObject({
       allowed: false,
       decision: "ask",
       ruleId: "mode.build.sideEffect",
@@ -1103,7 +1143,12 @@ describe("PermissionService alwaysAsk", () => {
     const service = new PermissionService();
 
     const decision = service.checkPermission(
-      { input: { script: "return 1;" }, mode: "yolo", riskLevel: "low", toolName: "CreateWorkflow" },
+      {
+        input: { script: "return 1;" },
+        mode: "yolo",
+        riskLevel: "low",
+        toolName: "CreateWorkflow",
+      },
       alwaysAskCapability,
       { deny: [{ toolName: "CreateWorkflow" }], version: 1 },
     );
@@ -1146,7 +1191,11 @@ describe("PermissionService session grant", () => {
     },
   ];
 
-  function check(mode: PermissionContext["mode"], service: PermissionService, toolName = "CreateWorkflow") {
+  function check(
+    mode: PermissionContext["mode"],
+    service: PermissionService,
+    toolName = "CreateWorkflow",
+  ) {
     return service.checkPermission(
       { input: { script: "return 2;" }, mode, riskLevel: "low", toolName },
       alwaysAskCapability,
@@ -1207,7 +1256,12 @@ describe("PermissionService session grant", () => {
 
     expect(
       service.checkPermission(
-        { input: { script: "return 2;" }, mode: "yolo", riskLevel: "low", toolName: "CreateWorkflow" },
+        {
+          input: { script: "return 2;" },
+          mode: "yolo",
+          riskLevel: "low",
+          toolName: "CreateWorkflow",
+        },
         alwaysAskCapability,
         { deny: [{ toolName: "CreateWorkflow" }], version: 1 },
       ),

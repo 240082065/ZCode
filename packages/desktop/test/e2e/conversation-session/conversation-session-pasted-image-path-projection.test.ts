@@ -1,11 +1,7 @@
+import { openWorkspaceDraftFromSidebar } from "../helpers/workspace-agent-warmup.js";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
-import {
-  clearAppData,
-  ensureWorkspaceItemExpanded,
-  getE2EAppDataPaths,
-  waitForWorkspaceApp,
-} from "../helpers/desktop-app.js";
+import { clearAppData, getE2EAppDataPaths, waitForWorkspaceApp } from "../helpers/desktop-app.js";
 import {
   assertUpstreamRequestCapture,
   waitForUpstreamNetworkCapture,
@@ -24,17 +20,18 @@ import { getTaskStoreSnapshot } from "../helpers/conversation-session-store.js";
 import { startConversationModelProviderReplayServer } from "../helpers/model-provider-replay.js";
 import {
   clickV4Send,
-  getV4PaneSnapshot,
   pasteV4ComposerImageAttachment,
   prepareV4ConversationE2E,
   selectV4TaskById,
   sendV4Prompt,
   setV4ComposerText,
-  startNewV4Draft,
+  getV4ModelConfig,
   waitForV4AssistantMessageContaining,
+  waitForV4ComposerSelectionReady,
   waitForV4Pane,
   waitForV4RowAttachments,
 } from "../helpers/v4-conversation.js";
+import { ensureProjectExpanded } from "../helpers/project-sidebar.js";
 
 const CASE_NAME = "conversation-session-pasted-image-path-projection";
 const VISION_MODEL = "e2e-pasted-image-vision-model";
@@ -95,6 +92,8 @@ describe("粘贴图片 provider path 投影 E2E", () => {
       throw new Error("T12-T14 没有完成隔离 provider seed");
     }
     await prepareV4ConversationE2E({ skipProvider: true });
+    // Recent 按项目隔离；首轮与 parking 必须从同一个项目创建，不能混用未选项目的启动草稿。
+    await openWorkspaceDraftFromSidebar(paths.workspace);
     await selectProviderModel(visionProvider.id, VISION_PROVIDER_NAME, VISION_MODEL);
 
     const runId = Date.now();
@@ -144,19 +143,18 @@ describe("粘贴图片 provider path 投影 E2E", () => {
     expect(persistedVisionConfig?.model).toContain(visionProvider.id);
     const liveStoreSnapshot = await getTaskStoreSnapshot(sessionId);
     expect(liveStoreSnapshot.activeTaskId).toBe(sessionId);
-    const activeTaskModel = liveStoreSnapshot.activeTaskConfigOptions.find(
-      (option) => option.category === "model",
-    )?.currentValue;
-    if (!activeTaskModel?.includes(visionProvider.id)) {
-      throw new Error(`active task 配置没有同步 v4 投影: ${JSON.stringify(liveStoreSnapshot)}`);
-    }
+    // 模型选择由 Composer Draft 持有；CLI configOptions 只保留模式，不再承载模型。
+    expect((await getV4ModelConfig()).provider).toBe(visionProvider.id);
+    expect((await getV4ModelConfig()).model).toBe(VISION_MODEL);
 
     // 冷恢复必须从另一个已持久会话进入；仅切到 deferred draft 后立即重启会中断
     // task-index 回源，无法证明目标 session 的真实 cold resume。
-    await startNewV4Draft();
-    const inheritedDraftConfig = await getV4PaneSnapshot();
-    expect(inheritedDraftConfig.initialDraftProvider).toBe(visionProvider.id);
-    expect(inheritedDraftConfig.initialDraftModel).toBe(VISION_MODEL);
+    await openWorkspaceDraftFromSidebar(paths.workspace);
+    await waitForV4ComposerSelectionReady();
+    // initialDraft* 是 legacy 初始化诊断；发送选择的权威是当前 Composer。
+    const inheritedDraftConfig = await getV4ModelConfig();
+    expect(inheritedDraftConfig.provider).toBe(visionProvider.id);
+    expect(inheritedDraftConfig.model).toBe(VISION_MODEL);
     const parkingMarker = `E2E_PASTED_IMAGE_PATH_PARKING_${runId}`;
     await sendV4Prompt(`${parkingMarker}: park before cold resume.`);
     await waitForV4AssistantMessageContaining(PARKING_REPLY, 60_000);
@@ -175,7 +173,7 @@ describe("粘贴图片 provider path 投影 E2E", () => {
     await Promise.all(liveProjection.paths.map((path) => unlink(path)));
     await restartIntoWorkspacePreservingProfile();
     await waitForWorkspaceApp(paths.workspace, 60_000);
-    await ensureWorkspaceItemExpanded(paths.workspace);
+    await ensureProjectExpanded(paths.workspace);
     await selectV4TaskById(sessionId, 60_000);
     await waitForV4Pane(
       (snapshot) => snapshot.sessionId === sessionId && snapshot.timelineText.includes(LIVE_REPLY),

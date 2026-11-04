@@ -12,6 +12,7 @@ type DesktopBridge = {
   executeDesktopCommand(command: string): Promise<void>;
   canOpenCommunity(locale: "zh-CN" | "en-US"): Promise<boolean>;
   setApplicationLocale(locale: "zh-CN" | "en-US"): Promise<void>;
+  getDeviceId(): Promise<string>;
 };
 
 async function command(command: string) {
@@ -102,11 +103,26 @@ describe("帮助配置 client/configs", () => {
     });
     await command("openCommunity");
     await expectExternal(fixture.remote.community_urls!["zh-CN"]!);
-    expect(server.requests).toHaveLength(1);
-    const query = new URL(server.requests[0]!.url, server.origin).searchParams;
+    // 同一端点也被 Host Provider Config 拉取（带 x-request-id）；缓存断言只统计 Main 的帮助请求。
+    const helpRequests = server.requests.filter((request) => !request.headers["x-request-id"]);
+    expect(helpRequests).toHaveLength(1);
+    const query = new URL(helpRequests[0]!.url, server.origin).searchParams;
     expect(query.get("app_version")).toBeTruthy();
     expect(query.get("platform")).toBe(`${process.platform}-${process.arch}`);
-    expect(server.requests[0]!.headers.authorization).toBeUndefined();
+    expect(helpRequests[0]!.headers.authorization).toBeUndefined();
+  });
+
+  it("HC-01-copy-device-mid: 真实帮助菜单复制当前设备 MID", async () => {
+    const expected = await browser.execute(async () => {
+      return (window as unknown as { zcode: DesktopBridge }).zcode.getDeviceId();
+    });
+    await $('button[aria-label="Help"]').click();
+    await $('[role="menuitem"]*=Copy device MID').click();
+    await browser.waitUntil(
+      async () =>
+        (await browser.electron.execute((electron) => electron.clipboard.readText())) === expected,
+      { timeout: 10_000, timeoutMsg: "系统剪贴板没有收到当前设备 MID" },
+    );
   });
 
   it("HC-02: 英文缺失只回退英文内置值", async () => {

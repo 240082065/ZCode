@@ -9,10 +9,9 @@ import {
   statfs,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
-import { clearAppData, getE2EAppDataPaths } from "../helpers/desktop-app.js";
-import { resolveE2ERuntimePath } from "../helpers/e2e-runtime-paths.js";
-import { ensureToolCrossProductFullAccessMode } from "../helpers/conversation-session-tool-cross-product.js";
+import { dirname, join } from "node:path";
+import { clearAppData, DEFAULT_WORKSPACE } from "../helpers/desktop-app.js";
+import { findE2EBashOutputPath, resolveE2ERuntimePath } from "../helpers/e2e-runtime-paths.js";
 import {
   getLatestUpstreamToolResultByToolCallId,
   countUpstreamRequests,
@@ -24,13 +23,16 @@ import {
 import {
   clickV4Stop,
   getV4PaneSnapshot,
+  getV4ConfigProjection,
   prepareV4ConversationE2E,
   sendV4Prompt,
+  switchV4Mode,
   selectV4TaskById,
-  startNewV4Draft,
   waitForV4AssistantMessageContaining,
   waitForV4ConversationState,
 } from "../helpers/v4-conversation.js";
+
+import { startDraftFromProject } from "../helpers/project-sidebar.js";
 
 const ROOT = resolveE2ERuntimePath("bash-direct-output", "中文 空格");
 const LIMIT = 5 * 1024 ** 3;
@@ -67,9 +69,15 @@ async function idle() {
 }
 async function prompt(marker: string, newTask = true) {
   if (newTask) {
-    await startNewV4Draft();
-    // 新草稿恢复 build 后必须重新固定权限前置，避免 producer 尚未执行就等待 barrier。
-    await ensureToolCrossProductFullAccessMode();
+    // 合并适配：全局新任务落到独立聊天目录，Bash fixture 必须从 ZCodeProject 发起。
+    await startDraftFromProject(DEFAULT_WORKSPACE);
+
+    // 项目新草稿恢复 build；显式选择 yolo，避免把模式切换动画中的旧文案当成已选中。
+    await switchV4Mode("yolo");
+    await browser.waitUntil(async () => (await getV4ConfigProjection()).mode === "yolo", {
+      timeout: 15000,
+      timeoutMsg: "项目草稿未应用 yolo 模式",
+    });
   }
   await sendV4Prompt(`${marker}: Execute the exact Bash output regression fixture.`);
 }
@@ -85,13 +93,8 @@ async function result(id: string) {
 async function outputPath(id: string) {
   const sessionId = (await getV4PaneSnapshot()).sessionId;
   expect(sessionId).not.toBe("draft");
-  const path = join(
-    getE2EAppDataPaths().storageRoot,
-    "cli",
-    "exec",
-    sessionId!,
-    `${id}-stdout.log`,
-  );
+  const path = await findE2EBashOutputPath(sessionId!, id);
+  if (!path) throw new Error(`Bash 未保留预期输出文件: ${sessionId}/${id}`);
   outputs.add(path);
   return path;
 }
@@ -137,7 +140,11 @@ describe("Bash 直接文件输出补充 E2E", () => {
       join(ROOT, "writer.cjs"),
     );
     await prepareV4ConversationE2E();
-    await ensureToolCrossProductFullAccessMode();
+    await switchV4Mode("yolo");
+    await browser.waitUntil(async () => (await getV4ConfigProjection()).mode === "yolo", {
+      timeout: 15000,
+      timeoutMsg: "项目草稿未应用 yolo 模式",
+    });
   });
   beforeEach(async () => {
     for (const name of await readdir(ROOT)) if (name.endsWith(".pid")) await rm(join(ROOT, name));
@@ -192,7 +199,10 @@ describe("Bash 直接文件输出补充 E2E", () => {
     await done("E2E_BDO_SMALL");
     expect((await result("toolu_bdo_small")).content).toBe("BDO_中文_STDOUT|中文_STDERR");
     expect((await result("toolu_bdo_empty_error")).content).toContain("Exit code 7");
-    expect(await stat(await outputPath("toolu_bdo_small")).catch(() => null)).toBeNull();
+    // 小输出应清理实际临时文件；检查当前 session/tool 的所有候选，而不是旧 HOME 路径。
+    expect(
+      await findE2EBashOutputPath((await getV4PaneSnapshot()).sessionId!, "toolu_bdo_small"),
+    ).toBeNull();
   });
 
   it("BDO02: 超过 64 MiB 的前台输出保留完整文件，详情只展示正文", async function () {
@@ -520,7 +530,9 @@ describe("Bash 直接文件输出补充 E2E", () => {
     await release("read-failure.release");
     await done("E2E_BDO_READ_FAILURE");
     expect((await result("toolu_bdo_read_failure")).content).toContain("bash output unavailable");
-    const blocked = await outputPath("toolu_bdo_open_failure");
+    // 故障注入必须沿用本 session 已发布的实际输出目录，不能在退役 HOME 根创建障碍。
+    const blocked = join(dirname(path), "toolu_bdo_open_failure-stdout.log");
+    outputs.add(blocked);
     await mkdir(blocked, { recursive: true });
     await prompt("E2E_BDO_OPEN_FAILURE", false);
     await done("E2E_BDO_OPEN_FAILURE");

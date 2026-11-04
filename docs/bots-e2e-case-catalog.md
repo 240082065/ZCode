@@ -25,6 +25,10 @@
 
 ## 接受用例
 
+2026-10-21：ReplyToChannel 默认注册和发送接线注释停用，MN-02/FN-01 组合 E2E 暂时跳过，
+原用例及 fixture 完整保留，待插件接入后恢复。MN-01/MN-03 中直接调用 Bot service 的测试
+继续保护原实现。下方默认工具发送记录仅作历史证据，不代表当前入口可用。
+
 ### BOT-E2E-MN-03：无原生 ID 的名字提及
 
 - Setup：已授权群/话题，群成员目录与历史可信机器人 mention；输入仅包含文字名字。
@@ -129,26 +133,35 @@
 
 ## BOT-E2E-DT-01 已删除任务自动新建（ZCT-2096089929570893824）
 
-- Status: pending；用例 `packages/desktop/test/e2e/bots/manual-review/pending/bot-deleted-task-recovery.test.ts`。
+- Status: pending；用例 `packages/desktop/test/e2e/bots/bot-deleted-task-recovery.test.ts`。
 - Setup: 已绑定 Feishu Bot 指向删除 tombstone 中的旧 task，保留旧交互状态；mock provider 记录通知请求。
 - Action: 普通消息进入 provider callback，随后重投相同 message id。
 - Assert: 不恢复旧 task；同工作区只新建并绑定一个 task；清理旧交互；一次提示说明已删除、新建和上下文不继承；只派发一次原消息；Desktop created 广播指向新 task；订阅仍为 bot-channel-continuous。
 - Fixture: case-local synthetic metadata，删除状态及 provider HTTP 由确定性夹具提供；不访问用户机器人。
+- 回归边界：删除索引可在订阅恢复与消息准入阶段分别读取；重投去重验证新建、派发、通知各一次，不约束内部读取次数。
 - Unit boundary: 本地/远端 identity、未删除但列表不可见（含归档/置顶）、索引读失败、新建失败、通知失败及中英文。仅归档行为保持原样。
 
 ### BOT-E2E-DF-01 Feishu reply delivery failure and recovery
 
-- Status: pending. Spec: `packages/desktop/test/e2e/bots/manual-review/pending/feishu-delivery-error.test.ts`.
+- Status: pending. Spec: `packages/desktop/test/e2e/bots/feishu-delivery-error.test.ts`.
 - Setup: bound private Feishu bot; synthetic HTTP business failure with code/msg/log_id.
-- Action: private command reply fails, then a subsequent reply succeeds; group input is rejected.
-- Assert: status exposes deliveryError without misreporting a WebSocket failure; error clears after successful delivery; private outbound uses open_id; group creates no task.
+- Action: private command reply fails, then a subsequent reply succeeds; input from a group that has not enabled the bot and does not mention it is ignored.
+- Assert: status exposes deliveryError without misreporting a WebSocket failure; error clears after successful delivery; private outbound uses open_id; ignored group input produces no reply, provider write, task creation, or prompt dispatch.
 - Evidence: service/provider HTTP and status projection; UI rendering is separately unit-tested. No claim of live Feishu tenant reproduction, mobile device validation, or DOM end-to-end coverage.
 
 DF-01 verification (2026-09-07): macOS Desktop WDIO passed (`desktop-e2e-20260907040958265-p60496-c535b8967f7e59a1`). HTTP 200/400 business failures, body/header log ID, update rejection, streaming circuit status, and localized error rendering are covered by 124 passing unit tests. Typecheck, Desktop E2E typecheck, and lint passed (43 warnings, 0 errors). Pending case is not promoted. Live Feishu, Windows/Linux, mobile devices, and delivery-failure DOM interaction remain unverified; existing connection-error DOM regression CF-01 passed in macOS Desktop WDIO.
 
+## BOT-E2E-RW-02：R3 stable / legacy Bot 身份
+
+- accepted：已握手 Source 与当前窗口远程 session 在线，回退快照仍是 legacy；以 stable 和 legacy Bot context 分别请求模型/任务入口。
+- 断言：两个入口归一到同一 stable scope；不误报断线、不调用本机 task、不额外建 Host/Agent；只授权的旧身份升级后仍限制为同一 Source。
+- 对照：同 path 不同 Source、重绑旧线路、preferred Profile 与在线线路不同、断线/重连换代、并发 task/model lookup、迟到 port 和 dispose。
+- 主证据为真实模块串联探针及 Bot service synthetic E2E；不声称真实飞书/Telegram 投递已验证。
+
 ## Feishu group collaboration (accepted, pending automation)
 
 - BOT-E2E-GR-01: two enabled groups and private chat retain separate task/configuration; member commands cannot switch tasks or approve. Group prompts carry trusted source to canonical admission; no legacy sendPrompt.
+  Group command acknowledgements quote the exact incoming message using the provider reply endpoint, as required by the group reply contract; they must not be asserted as unquoted chat-id sends.
 - BOT-E2E-GR-02: owner/member inputs queue during execution; cancellation affects the CLI item only; busy task switching reports running/queue/interaction reasons. After Desktop stop, stale Bot approval records do not block a new draft. Desktop and mobile show source/attachments from the same canonical rows and queue.
 - BOT-E2E-GR-03: final summaries persist per delivery segment; unknown outcomes are not replayed; disabled/switched groups reject saved-result resend. No tool or streaming output enters group.
 - BOT-E2E-GR-04: completed reply action bar shows compact recovery only for its own unresolved deliveries; clicking opens actions without repeating the result body, and resolving hides the icon; no persistent group-sync/shared-workspace banner. Saved-result retry never resubmits a prompt. Source labels support zh-CN/en-US and narrow layouts.
@@ -181,7 +194,7 @@ Live tenant permission and actual member-name rendering require separate evidenc
 - Action：同一 task 依次接收 IM、desktop、mobile 轮次，完成后再运行；禁用后注入迟到输出。
 - Assert：每轮一次回复，飞书卡片不覆写前轮，终态后保留订阅，禁用后无出站。
 - Evidence：controlled-stream 服务到 provider HTTP 的 Desktop runner 用例；不将合成 inputOrigin 当作真实手机/CLI 输入证据。
-- Status：pending，`bots/manual-review/pending/bot-private-task-sync.test.ts`。
+- Status：pending，`bots/bot-private-task-sync.test.ts`。
 
 ### BOT-E2E-MN-01 原生渠道 mention 回复
 
@@ -200,16 +213,16 @@ BOT-UI-MN：真实正式气泡、准备气泡与队列组件在 390/1200px、深
 用户已确认实施整个分支的覆盖补齐；重复成功回执保持现状，不增加去重断言。
 状态 owner：CLI CommandInbox 管 admission/执行，Bot Host 管绑定、材料及 delivery，UI 只投影；不另建队列。
 
-| Case | Setup → Action → Assert | 证据与状态 |
-| --- | --- | --- |
-| BOT-E2E-TP-04 | 真实 CLI 话题运行中 → Bot 接收新消息 → 自动停止旧 run，权威终态后续接，零排队，旧输出不冒充新轮 | Host/CLI/模型 HTTP，pending |
-| BOT-E2E-TP-05 | 已接收历史文件索引 → 真实 ReadSessionContext → Host 验证并下载，CLI 收到正确文件；其他任务/失效授权不下载 | Host/CLI/模拟平台 HTTP，pending |
-| BOT-E2E-FN-01 | 工具输出后终态含完整正文 → adapter 对账 → 完整结果仅回传一次；普通对话仍正常 | adapter/真实 stream/平台出站，pending |
-| BOT-E2E-MN-02 | 真实 CLI 触发 ReplyToChannel → 原生提及成功 → 客户端续聊按名字查询新目标，无 botGroupSource，不弹默认审批 | Host/CLI/模拟平台 HTTP，pending |
-| BOT-E2E-GR-02 | 运行中接收群输入 → 取消及正常晋升分别执行 → FIFO、原始来源、同卡终态与不重复输入 | 调整已有 runtime case |
-| BOT-E2E-GR-UI-01 | 两机器人/两群 → 设置开关、失败及恢复 → 隔离、持久化、不补发 | 新增 UI 候选 |
-| BOT-E2E-PS-01 | 私聊绑定 task → IM/desktop/mobile 连续轮次与重启 → 一轮一回传，失败显式重试 | 扩展已有候选，模拟 origin 不计手机 UI |
-| BOT-E2E-MN-01/TP-03 | 群/话题与多个身份 → 回复和管理员操作 → quote、条件 @、管理员提醒及幂等 | 扩展现有服务候选 |
+| Case                | Setup → Action → Assert                                                                                   | 证据与状态                            |
+| ------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| BOT-E2E-TP-04       | 真实 CLI 话题运行中 → Bot 接收新消息 → 自动停止旧 run，权威终态后续接，零排队，旧输出不冒充新轮           | Host/CLI/模型 HTTP，pending           |
+| BOT-E2E-TP-05       | 已接收历史文件索引 → 真实 ReadSessionContext → Host 验证并下载，CLI 收到正确文件；其他任务/失效授权不下载 | Host/CLI/模拟平台 HTTP，pending       |
+| BOT-E2E-FN-01       | 工具输出后终态含完整正文 → adapter 对账 → 完整结果仅回传一次；普通对话仍正常                              | adapter/真实 stream/平台出站，pending |
+| BOT-E2E-MN-02       | 真实 CLI 触发 ReplyToChannel → 原生提及成功 → 客户端续聊按名字查询新目标，无 botGroupSource，不弹默认审批 | Host/CLI/模拟平台 HTTP，pending       |
+| BOT-E2E-GR-02       | 运行中接收群输入 → 取消及正常晋升分别执行 → FIFO、原始来源、同卡终态与不重复输入                          | 调整已有 runtime case                 |
+| BOT-E2E-GR-UI-01    | 两机器人/两群 → 设置开关、失败及恢复 → 隔离、持久化、不补发                                               | 新增 UI 候选                          |
+| BOT-E2E-PS-01       | 私聊绑定 task → IM/desktop/mobile 连续轮次与重启 → 一轮一回传，失败显式重试                               | 扩展已有候选，模拟 origin 不计手机 UI |
+| BOT-E2E-MN-01/TP-03 | 群/话题与多个身份 → 回复和管理员操作 → quote、条件 @、管理员提醒及幂等                                    | 扩展现有服务候选                      |
 
 剪枝：Feishu/Lark 平台差异由服务候选双平台覆盖，真实 CLI 主链路优先 Feishu；不机械交叉所有平台与主题。
 主题/宽度由组件浏览器验证；真实手机 replayable、SSH 身份、平台租户通知分别记录，不能以窄屏或 stub 代替。

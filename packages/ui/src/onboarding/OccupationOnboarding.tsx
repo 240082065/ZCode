@@ -77,7 +77,6 @@ export function OccupationOnboarding({
   const [needsOnboarding, markOnboarded] = useOnboardingTrigger({
     onboardingRecord,
     userId,
-    hasStoredOccupation: Boolean(settings?.onboardingOccupation),
     loadDeviceMid,
     update,
   });
@@ -238,7 +237,7 @@ export function OccupationOnboarding({
       setStep(0);
       setDismissed(true);
       setRequested(false);
-      if (!skip && migration) requestOnboardingDialog("migration");
+      if (!skip && migration) requestOnboardingDialog();
       logger.info("[occupation-onboarding] 偏好保存完成", { interfaceMode: mode });
       if (onboardingRecord) {
         try {

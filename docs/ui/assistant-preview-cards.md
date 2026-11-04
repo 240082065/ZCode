@@ -238,3 +238,55 @@ instead of path existence booleans.
   workspace, session, log epoch, turn, and card signature prevents virtualized
   remounts and equivalent re-renders from reopening a tab after the user closes
   it.
+
+## Card action menus
+
+The entire card supports a context menu. The entire card surface — blank space,
+icon, title, and subtitle — is one transparent full-card button that triggers the
+same in-app preview action as the Open primary button. The right-side Open and
+dropdown controls render above that transparent button, so one click never fires
+the card action and a control action at the same time. When the preview action is
+unavailable, the transparent button is disabled together with the Open button.
+Because the surface is a real `<button>`, Tab focus and Enter or Space activation
+work without extra handlers, and its accessible name is the Open label plus the
+card title (Chinese: `打开 {title}`). The existing Open button and dropdown retain their original labels, flat
+application list, width and path-action order. Only the card context menu adds
+new actions; both entry points reuse the same opening handlers. File context
+menus offer Preview, Open (the system default application), an Open with submenu,
+then copying relative and absolute paths. The context menu omits Open containing
+folder and its separator. Chinese labels are 预览 and 打开.
+Website cards use the same Preview and Open labels for side-pane and browser
+actions, followed by copying the URL; file-backed local HTML additionally offers path actions.
+The card primary button continues to read Open for all card types.
+
+Native file actions require the platform's explicit `canOpenLocalFiles` capability.
+Web and mobile omit them. Remote files never use the local default application;
+Open with retains the existing exact workspace identity/session match.
+Unavailable platform actions are omitted, while temporarily loading application
+choices display a disabled loading row. Preview keeps the existing scoped source
+and mobile pane presentation.
+
+```text
+card context menu / unified file-application dropdown
+              -> shared action owner (OpenSplitButton)
+              -> existing preview callback / platform port / file action hook
+```
+
+The menu owns only transient UI state. It adds no runtime queue, protocol,
+snapshot, or recovery state; desktop continuous and mobile replayable delivery
+remain unchanged. Async app discovery is scoped to the target and ignores stale
+results after the target changes or unmounts. Both menus reuse the design system
+primitives, keyboard navigation, light/dark tokens and localized labels.
+
+APC14 acceptance: right-click a real Office card, verify accessible application names,
+explicit default-first ordering, first-three plus More grouping and no directory entry.
+Exercise 0/1/3/10 candidates with an isolated main IPC fixture, preview the file,
+and verify the selected application ID and file target at the IPC boundary.
+The fixture does not claim native enumeration or external application launch.
+Browser acceptance (`packages/ui/test/browser/manual-review/pending/preview-card-actions.test.mjs`)
+covers the whole-card click contract for file and website cards: clicking the
+card body previews exactly once, clicking the Open button previews exactly
+once, clicking the dropdown trigger only expands the menu, and the overlay
+button supports Enter and Space activation. APC E2E exercises the card body
+click on a localhost website card (APC01) and a Markdown file card (APC05)
+alongside the existing Open-button path.

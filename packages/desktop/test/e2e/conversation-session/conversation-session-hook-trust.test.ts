@@ -1,10 +1,11 @@
+import { openWorkspaceDraftFromSidebar } from "../helpers/workspace-agent-warmup.js";
 /**
  * 正式 E2E —— Workspace Hook Trust 软门禁与逐条持久信任（HK05–HK07）。
  * 已通过人工 review 并由 e2e:promote 从 manual-review/pending 晋级，
  * 随默认 spec 发现进入常规回归门禁；fixture 走 case-local provider replay。
  *
  * 证据分层：
- * - UI/交互：pending banner、Settings 钩子行内“信任”按钮、锁定 Switch
+ * - UI/交互：composer Hook 图标浮层、Settings 钩子行内“信任”按钮、锁定 Switch
  * - Runtime：`.hook-trust-e2e/executions.jsonl` 执行证据（未信任零执行、不补跑、
  *   信任后自然事件执行）
  * - 持久化：`<E2E_HOME>/.zcode/security/workspace-hook-trust-v1.json` 精确落盘
@@ -13,15 +14,18 @@
  * 首个 agent 进程冷启动即加载 workspace hooks；spec 内不重复安装。
  */
 import {
+  TID_CHAT_MODE_SELECT_TRIGGER,
+  TID_V4_WORKSPACE_HOOK_PENDING_TRIGGER,
+  TID_V4_WORKSPACE_HOOK_PENDING_UNREAD,
   TID_SETTINGS_BACK_BUTTON,
   TID_SETTINGS_PAGE,
   TID_SETTINGS_SECTION_NAV,
   TID_TASK_SETTINGS_BUTTON,
-  TID_V4_WORKSPACE_HOOK_PENDING_BANNER,
+  TID_V4_WORKSPACE_HOOK_PENDING_POPOVER,
   TID_V4_WORKSPACE_HOOK_PENDING_DISMISS,
   TID_V4_WORKSPACE_HOOK_PENDING_REVIEW,
   testId,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import {
   DEFAULT_WORKSPACE,
   clearAppData,
@@ -39,15 +43,13 @@ import {
 import {
   prepareV4ConversationE2E,
   sendV4Prompt,
-  startNewV4Draft,
   waitForV4Pane,
 } from "../helpers/v4-conversation.js";
 
 const HOOKS_SECTION_SELECTOR = '[data-testid="hooks-settings-section"]';
 const HOOK_ROW_SELECTOR = '//div[@data-testid="configured-hook-row"]';
 // 信任按钮通过 ShieldCheck 图标定位（lucide class），不依赖 locale 文案。
-const TRUST_BUTTON_IN_ROW =
-  './/button[.//*[contains(@class, "lucide-shield-check")]]';
+const TRUST_BUTTON_IN_ROW = './/button[.//*[contains(@class, "lucide-shield-check")]]';
 
 describe("Workspace Hook Trust (HK05–HK07)", () => {
   before(async function () {
@@ -60,19 +62,42 @@ describe("Workspace Hook Trust (HK05–HK07)", () => {
     await clearAppData();
   });
 
-  it("HK05: 未信任 Hook 被软门禁跳过，banner 引导进设置，行内只提供信任与锁定开关", async function () {
+  it("HK05: 未信任 Hook 被软门禁跳过，图标浮层引导进设置，行内只提供信任与锁定开关", async function () {
     this.timeout(180000);
 
+    expect(await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_TRIGGER)).isExisting()).toBe(false);
     await sendV4Prompt("E2E_HOOK_TRUST: reply with ok");
     await waitForIdle("Soft-gated turn did not return to idle");
 
     // 软门禁不阻塞对话，且未信任 Hook 零执行。
-    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_BANNER)).waitForDisplayed({
-      timeout: 30000,
-    });
+    const trigger = $(sel(TID_V4_WORKSPACE_HOOK_PENDING_TRIGGER));
+    await trigger.waitForDisplayed({ timeout: 30000 });
+    expect(await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_UNREAD)).isDisplayed()).toBe(true);
+    expect(await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_POPOVER)).isExisting()).toBe(false);
+    expect(await $('[data-testid="v4-workspace-hook-pending-banner"]').isExisting()).toBe(false);
+    const adjacent = await browser.execute(
+      (modeId, hookId) => {
+        const mode = document.querySelector(`[data-testid="${modeId}"]`)!;
+        const hook = document.querySelector(`[data-testid="${hookId}"]`)!;
+        const a = mode.getBoundingClientRect();
+        const b = hook.getBoundingClientRect();
+        return b.left >= a.right && b.left - a.right <= 12 && Math.abs(a.top - b.top) <= 2;
+      },
+      TID_CHAT_MODE_SELECT_TRIGGER,
+      TID_V4_WORKSPACE_HOOK_PENDING_TRIGGER,
+    );
+    expect(adjacent).toBe(true);
+    await trigger.click();
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_POPOVER)).waitForDisplayed();
+    expect(await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_UNREAD)).isExisting()).toBe(false);
+    await browser.keys("Escape");
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_POPOVER)).waitForDisplayed({ reverse: true });
+    expect(await trigger.isFocused()).toBe(true);
+    await browser.keys("Enter");
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_POPOVER)).waitForDisplayed();
     expect(await readHookTrustExecutions()).toHaveLength(0);
 
-    // 从 pending banner 进入 设置 → 钩子。
+    // 从 composer Hook 图标浮层 进入 设置 → 钩子。
     await clickTestIdByDom(TID_V4_WORKSPACE_HOOK_PENDING_REVIEW, {
       timeout: 15000,
     });
@@ -89,18 +114,21 @@ describe("Workspace Hook Trust (HK05–HK07)", () => {
       await assertUntrustedHookRow(label);
     }
 
-    // 忽略 banner 是 renderer 本地行为，不产生 Trust mutation。
+    // 忽略图标 是 renderer 本地行为，不产生 Trust mutation。
     await clickTestIdByDom(TID_SETTINGS_BACK_BUTTON, {
       timeout: 15000,
     });
     await waitForWorkspaceApp(DEFAULT_WORKSPACE, 30000);
+    expect(await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_UNREAD)).isExisting()).toBe(false);
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_TRIGGER)).click();
     await clickTestIdByDom(TID_V4_WORKSPACE_HOOK_PENDING_DISMISS, {
       timeout: 15000,
     });
-    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_BANNER)).waitForDisplayed({
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_POPOVER)).waitForDisplayed({
       timeout: 15000,
       reverse: true,
     });
+    expect(await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_TRIGGER)).isExisting()).toBe(false);
     expect(await readHookTrustStore()).toBeNull();
   });
 
@@ -122,10 +150,7 @@ describe("Workspace Hook Trust (HK05–HK07)", () => {
 
     // 被信任的行按钮消失；其余两条仍显示“信任”。
     await assertNoTrustButton(E2E_HOOK_TRUST_LABELS.sessionStartA);
-    for (const label of [
-      E2E_HOOK_TRUST_LABELS.sessionStartB,
-      E2E_HOOK_TRUST_LABELS.promptSubmit,
-    ]) {
+    for (const label of [E2E_HOOK_TRUST_LABELS.sessionStartB, E2E_HOOK_TRUST_LABELS.promptSubmit]) {
       await (await findTrustButton(label)).waitForDisplayed({ timeout: 15000 });
     }
 
@@ -154,19 +179,16 @@ describe("Workspace Hook Trust (HK05–HK07)", () => {
     await waitForIdle("Second turn did not return to idle");
 
     const inTaskExecutions = await readHookTrustExecutions();
-    expect(
-      inTaskExecutions.filter((item) => item.event === "SessionStart"),
-    ).toHaveLength(0);
-    expect(
-      inTaskExecutions.some(
-        (item) => item.label === E2E_HOOK_TRUST_LABELS.promptSubmit,
-      ),
-    ).toBe(true);
+    expect(inTaskExecutions.filter((item) => item.event === "SessionStart")).toHaveLength(0);
+    expect(inTaskExecutions.some((item) => item.label === E2E_HOOK_TRUST_LABELS.promptSubmit)).toBe(
+      true,
+    );
 
     // 第二段（新 task）：catalog HK07 字面语义——新 task 的自然 SessionStart
     // 按 Trust 执行。该路径与 UserPromptSubmit 不同：覆盖新 session 冷启动时
     // 的配置发现、trust store 读取与 admission 评估全链路，不以"语义等价"省略。
-    await startNewV4Draft();
+    // 全局新建会分配虚拟目录；Hook、Skill 与会话候选必须继续使用夹具所属项目。
+    await openWorkspaceDraftFromSidebar(DEFAULT_WORKSPACE);
     await sendV4Prompt("E2E_HOOK_TRUST new task: reply with ok");
     await waitForHookTrustExecution(
       E2E_HOOK_TRUST_LABELS.sessionStartA,
@@ -174,26 +196,107 @@ describe("Workspace Hook Trust (HK05–HK07)", () => {
     );
     await waitForIdle("New-task turn did not return to idle");
 
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_UNREAD)).waitForDisplayed();
     const executions = await readHookTrustExecutions();
     // 已信任的 a 在新 task 自然 SessionStart 执行且仅执行一次；
     // 未信任的 b 仍被软门禁跳过。
     expect(
       executions.filter((item) => item.label === E2E_HOOK_TRUST_LABELS.sessionStartA),
     ).toHaveLength(1);
-    expect(
-      executions.some(
-        (item) => item.label === E2E_HOOK_TRUST_LABELS.sessionStartB,
-      ),
-    ).toBe(false);
+    expect(executions.some((item) => item.label === E2E_HOOK_TRUST_LABELS.sessionStartB)).toBe(
+      false,
+    );
+    // 响应式验收放在项目导航之后，避免窄视口影响后续侧栏操作。
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_TRIGGER)).click();
+    await verifyHookReminderLayouts();
+    await browser.keys("Escape");
+    await $(sel(TID_V4_WORKSPACE_HOOK_PENDING_POPOVER)).waitForDisplayed({ reverse: true });
   });
 });
+
+async function verifyHookReminderLayouts(): Promise<void> {
+  const original = await browser.execute(() => {
+    const actions = (
+      window as typeof window & {
+        __testActions: { getTheme(): string; getLocale(): string };
+      }
+    ).__testActions;
+    return { theme: actions.getTheme(), locale: actions.getLocale() };
+  });
+  try {
+    for (const width of [1200, 390]) {
+      await browser.electron.execute(async (electron, width) => {
+        const target = electron.BrowserWindow.getAllWindows().find(
+          (w) => w.isVisible() && !w.isDestroyed(),
+        )!;
+        if (!target.webContents.debugger.isAttached()) target.webContents.debugger.attach("1.3");
+        await target.webContents.debugger.sendCommand("Emulation.setDeviceMetricsOverride", {
+          width,
+          height: 844,
+          deviceScaleFactor: 1,
+          mobile: false,
+        });
+      }, width);
+      for (const theme of ["zai-light", "zai-dark"]) {
+        for (const locale of ["zh-CN", "en-US"]) {
+          await browser.execute(
+            ({ theme, locale }) => {
+              const actions = (
+                window as typeof window & {
+                  __testActions: { setTheme(value: string): void; setLocale(value: string): void };
+                }
+              ).__testActions;
+              actions.setTheme(theme);
+              actions.setLocale(locale);
+            },
+            { theme, locale },
+          );
+          const popover = $(sel(TID_V4_WORKSPACE_HOOK_PENDING_POPOVER));
+          await expect(popover).toHaveText(
+            expect.stringContaining(
+              locale === "zh-CN" ? "工作区 Hook 待审核" : "workspace hook(s) pending review",
+            ),
+          );
+          await browser.waitUntil(() =>
+            browser.execute((id) => {
+              const rect = document.querySelector(`[data-testid="${id}"]`)!.getBoundingClientRect();
+              return (
+                rect.left >= 0 &&
+                rect.right <= innerWidth &&
+                rect.top >= 0 &&
+                rect.bottom <= innerHeight
+              );
+            }, TID_V4_WORKSPACE_HOOK_PENDING_POPOVER),
+          );
+          await browser.saveScreenshot(
+            `.e2e-artifacts/hook-reminder-${width}-${theme}-${locale}.png`,
+          );
+        }
+      }
+    }
+  } finally {
+    await browser.electron.execute(async (electron) => {
+      const target = electron.BrowserWindow.getAllWindows().find(
+        (w) => w.isVisible() && !w.isDestroyed(),
+      )!;
+      await target.webContents.debugger.sendCommand("Emulation.clearDeviceMetricsOverride");
+    });
+    await browser.execute(({ theme, locale }) => {
+      const actions = (
+        window as typeof window & {
+          __testActions: { setTheme(value: string): void; setLocale(value: string): void };
+        }
+      ).__testActions;
+      actions.setTheme(theme);
+      actions.setLocale(locale);
+    }, original);
+  }
+}
 
 async function waitForIdle(timeoutMsg: string): Promise<void> {
   await waitForV4Pane(
     (snapshot) =>
-      snapshot.sessionId !== null &&
-      snapshot.sessionId !== "draft" &&
-      !snapshot.canStop,
+      snapshot.sessionId !== null && snapshot.sessionId !== "draft" && !snapshot.canStop,
     timeoutMsg,
     60000,
   );
@@ -225,11 +328,8 @@ async function waitForHookTrustRowCount(count: number): Promise<void> {
       browser.execute(
         (expected: number) =>
           Array.from(
-            document.querySelectorAll<HTMLElement>(
-              '[data-testid="configured-hook-row"]',
-            ),
-          ).filter((row) => row.innerText.includes("hook-trust-")).length ===
-          expected,
+            document.querySelectorAll<HTMLElement>('[data-testid="configured-hook-row"]'),
+          ).filter((row) => row.innerText.includes("hook-trust-")).length === expected,
         count,
       ),
     {
@@ -256,7 +356,9 @@ async function clickTrustButton(label: string): Promise<void> {
 async function assertNoTrustButton(label: string): Promise<void> {
   const row = await $(hookRowSelector(label));
   await row.waitForDisplayed({ timeout: 15000 });
-  await (await row.$(TRUST_BUTTON_IN_ROW)).waitForExist({
+  await (
+    await row.$(TRUST_BUTTON_IN_ROW)
+  ).waitForExist({
     timeout: 15000,
     reverse: true,
   });

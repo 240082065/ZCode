@@ -1,16 +1,19 @@
 import {
-  TID_AUTOMATIONS_OPEN,
   TID_AUTOMATIONS_PAGE_TAB,
-  TID_CHAT_ATTACHMENT_BUTTON,
   TID_SETTINGS_DYNAMIC_WORKFLOW_MODE_ITEM,
   TID_SETTINGS_DYNAMIC_WORKFLOW_MODE_TRIGGER,
+  type DynamicWorkflowMode,
+} from "@zcode/shared";
+import {
+  TID_AUTOMATIONS_OPEN,
+  TID_CHAT_ATTACHMENT_BUTTON,
+  TID_SETTINGS_BACK_BUTTON,
   TID_SETTINGS_PAGE,
   TID_SETTINGS_SECTION_NAV,
   TID_TASK_SETTINGS_BUTTON,
   TID_V4_COMPOSER_INPUT,
   testId,
-  type DynamicWorkflowMode,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import {
   clickTestIdByDom,
   clickTestIdByWebDriver,
@@ -107,7 +110,14 @@ export async function readPlusMenuAddOptionIds(): Promise<string[]> {
 
 /** 从侧栏进入自动化页，并等页面内容容器渲染。 */
 export async function openAutomationsPage(): Promise<void> {
-  await clickTestIdByDom(TID_AUTOMATIONS_OPEN, {
+  // 原因：设置页背后仍挂载侧栏 DOM；直接 DOM click 会命中用户不可见的入口，设置遮罩仍在。
+  // 先从设置返回工作区，再按真实指针路径进入自动化页。
+  const settings = $(sel(TID_SETTINGS_PAGE));
+  if (await settings.isDisplayed()) {
+    await clickTestIdByWebDriver(TID_SETTINGS_BACK_BUTTON);
+    await settings.waitForDisplayed({ reverse: true });
+  }
+  await clickTestIdByWebDriver(TID_AUTOMATIONS_OPEN, {
     timeoutMsg: "侧栏没有出现自动化入口",
   });
   await $(AUTOMATIONS_CONTENT_SELECTOR).waitForDisplayed({

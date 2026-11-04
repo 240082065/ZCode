@@ -2,21 +2,19 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   TID_PREVIEW_PANE,
-  TID_WORKSPACE_FILE_TREE_BUTTON,
   TID_WORKSPACE_FILE_TREE_PANEL,
   TID_WORKSPACE_FILE_TREE_REFRESH_BUTTON,
   TID_WORKSPACE_FILE_TREE_ROW,
-  TID_WORKSPACE_ITEM,
   testId,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import {
   DEFAULT_WORKSPACE,
   clearAppData,
   clickTestIdByDom,
-  hoverTestIdByWebDriver,
   waitForDefaultWorkspaceReady,
   waitForTestIdByDom,
 } from "./helpers/desktop-app.js";
+import { openProjectFileTree } from "./helpers/project-sidebar.js";
 
 const TREE_DIR = join(DEFAULT_WORKSPACE, "e2e-file-tree-refresh");
 const OLD_FILE = join(TREE_DIR, "old-name.txt");
@@ -35,9 +33,18 @@ describe("工作区文件树刷新 E2E", () => {
 
     await rm(TREE_DIR, { recursive: true, force: true });
     await waitForDefaultWorkspaceReady();
+    await assertTaskListScrollMask();
     await mkdir(TREE_DIR, { recursive: true });
     await writeFile(OLD_FILE, "old file", "utf-8");
 
+    // 文件树已迁到右侧标签；左侧导航保持可用，不再等待退役侧栏的位移动画。
+    await openWorkspaceFileTree();
+    await expect($('[data-project-sidebar-panel="navigation"]')).toBeDisplayed();
+    const activeFileTab = $('[data-side-pane-tab-id][data-state="active"]');
+    await activeFileTab.moveTo();
+    await activeFileTab.$("button[aria-label]").click();
+    await $(`[data-testid="${TID_WORKSPACE_FILE_TREE_PANEL}"]`).waitForExist({ reverse: true });
+    await expect($('[data-project-sidebar-panel="navigation"]')).toBeDisplayed();
     await openWorkspaceFileTree();
     await clickWorkspaceFileTreeRow(TREE_DIR);
     await waitForWorkspaceFileTreeRow(OLD_FILE);
@@ -68,8 +75,7 @@ describe("工作区文件树刷新 E2E", () => {
 
 async function openWorkspaceFileTree() {
   // 修复原因：workspace action 只在整行 hover/focus 后挂载。
-  await hoverTestIdByWebDriver(testId(TID_WORKSPACE_ITEM, DEFAULT_WORKSPACE));
-  await clickTestIdByDom(testId(TID_WORKSPACE_FILE_TREE_BUTTON, DEFAULT_WORKSPACE), {
+  await openProjectFileTree(DEFAULT_WORKSPACE, {
     timeoutMsg: "没有找到工作区文件树入口",
   });
   await waitForTestIdByDom(TID_WORKSPACE_FILE_TREE_PANEL, {
@@ -134,4 +140,69 @@ async function waitForWorkspaceFileTreeRowMissing(path: string) {
       timeoutMsg: `文件树仍显示已重命名的旧路径: ${path}`,
     },
   );
+}
+
+async function assertTaskListScrollMask() {
+  const selector = '[data-project-sidebar-panel="navigation"] [data-scroll-mask]';
+  const previousStyle = await browser.execute((query) => {
+    const viewport = document.querySelector<HTMLElement>(query);
+    if (!viewport) throw new Error("task 列表未使用滚动渐隐容器");
+    const style = viewport.getAttribute("style");
+    viewport.style.flex = "none";
+    viewport.style.height = "40px";
+    viewport.scrollTop = 0;
+    viewport.dispatchEvent(new Event("scroll"));
+    return style;
+  }, selector);
+  const assertMask = async (mask: string) => {
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (query, expected) => {
+            const viewport = document.querySelector<HTMLElement>(query);
+            return (
+              viewport?.dataset.scrollMask === expected &&
+              (expected === "none"
+                ? getComputedStyle(viewport).maskImage === "none"
+                : getComputedStyle(viewport!).maskImage.includes("linear-gradient"))
+            );
+          },
+          selector,
+          mask,
+        ),
+      { timeout: 5000, timeoutMsg: `task 列表 mask 未变为 ${mask}` },
+    );
+  };
+  try {
+    await assertMask("bottom");
+    await browser.execute((query) => {
+      const viewport = document.querySelector<HTMLElement>(query)!;
+      viewport.scrollTop = (viewport.scrollHeight - viewport.clientHeight) / 2;
+      viewport.dispatchEvent(new Event("scroll"));
+    }, selector);
+    await assertMask("both");
+    await browser.execute((query) => {
+      const viewport = document.querySelector<HTMLElement>(query)!;
+      viewport.scrollTop = viewport.scrollHeight;
+      viewport.dispatchEvent(new Event("scroll"));
+    }, selector);
+    await assertMask("top");
+    await browser.execute((query) => {
+      const viewport = document.querySelector<HTMLElement>(query)!;
+      viewport.style.height = `${viewport.scrollHeight + 20}px`;
+    }, selector);
+    await assertMask("none");
+  } finally {
+    await browser.execute(
+      (query, style) => {
+        const viewport = document.querySelector<HTMLElement>(query)!;
+        if (style === null) viewport.removeAttribute("style");
+        else viewport.setAttribute("style", style);
+        viewport.scrollTop = 0;
+        viewport.dispatchEvent(new Event("scroll"));
+      },
+      selector,
+      previousStyle,
+    );
+  }
 }

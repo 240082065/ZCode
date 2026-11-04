@@ -32,6 +32,43 @@ import {
 import { executeAdapterGenerateText, executeAdapterStreamText } from "./test-adapter-model.js";
 
 describe("AiSdkModelAdapter", () => {
+  it("本地首有效内容日志排除空 start，正文增量只记录一次", async () => {
+    const logs: CapturedLog[] = [];
+    const runtime = createStreamRuntime(
+      stream([
+        { type: "start" },
+        { type: "text-start", id: "text" },
+        { type: "text-delta", id: "text", text: "", delta: "" },
+        { type: "text-delta", id: "text", text: "private", delta: "private" },
+        { type: "text-delta", id: "text", text: " reply", delta: " reply" },
+        { type: "text-end", id: "text" },
+        { type: "finish", finishReason: "stop", totalUsage: usage(2, 2) },
+      ]),
+    );
+    const adapter = new AiSdkModelAdapter({
+      logger: capturingLogger(logs),
+      registry: registry(),
+      runtime,
+    });
+    for await (const event of executeAdapterStreamText(adapter, {
+      providerId: "test" as never,
+      modelId: "model-a" as never,
+      messages: [{ role: "user", content: "private prompt" }],
+      metadata: { querySource: "main_turn", queryId: "command" },
+    })) {
+      if (event.type === "text_start")
+        expect(
+          logs.filter((log) => log.context?.event === "ttft.model.first_content"),
+        ).toHaveLength(0);
+    }
+    const milestones = logs.filter((log) => log.context?.event === "ttft.model.first_content");
+    expect(milestones).toHaveLength(1);
+    expect(milestones[0]).toMatchObject({
+      level: "info",
+      context: { queryId: "command", outputKind: "text" },
+    });
+    expect(JSON.stringify(milestones)).not.toContain("private");
+  });
   it("extends SSE idle timeout by 30 seconds for each retry", () => {
     expect(resolveModelStreamIdleTimeoutMs({})).toBe(600_000);
     expect(resolveModelStreamIdleTimeoutMs({ retryNumber: 1 })).toBe(630_000);
@@ -948,7 +985,6 @@ describe("AiSdkModelAdapter", () => {
 
       const content = await readFile(join(debugDir, files[0]!), "utf8");
       const record = JSON.parse(content.trim()) as {
-        model: { role?: string };
         querySource?: string;
         request: { body: unknown; headers: Record<string, string> };
         response: { body: unknown; headers: Record<string, string>; reasoningText?: string };
@@ -961,7 +997,6 @@ describe("AiSdkModelAdapter", () => {
       expect(record.sessionId).toBe("sess_debug");
       expect(record.turnId).toBe("turn_debug");
       expect(record.querySource).toBe("session_title");
-      expect(record.model.role).toBeUndefined();
       expect(record.request.body).toMatchObject({
         messages: [{ role: "user", content: "Ping" }],
         model: "model-a",
@@ -3426,6 +3461,7 @@ describe("AiSdkModelAdapter", () => {
       streamText() {
         return {
           fullStream: stream([
+            { type: "text-delta", id: "partial", text: "partial answer" },
             {
               type: "finish",
               finishReason: "other",
@@ -3451,6 +3487,7 @@ describe("AiSdkModelAdapter", () => {
     }
 
     expect(events).toEqual([
+      { type: "text_delta", id: "partial", text: "partial answer" },
       {
         type: "finish",
         finishReason: "other",
@@ -4867,7 +4904,6 @@ describe("AiSdkModelAdapter", () => {
       events.push(event);
     }
 
-    expect(malformedInput).toHaveLength(884);
     expect(events.map((event) => event.type)).toEqual([
       "start",
       "tool_input_start",

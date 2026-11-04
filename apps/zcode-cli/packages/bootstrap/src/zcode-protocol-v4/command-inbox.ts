@@ -23,6 +23,9 @@ export type GuardDecision =
 type PersistentLookup = (key: CommandKey) => Promise<CommandAck | null> | CommandAck | null;
 
 export interface CommandInboxHost {
+  /** 幂等查询完成后、持有 session admission 时准备冷会话，不另设接受队列。 */
+  prepareDecision?(envelope: CommandEnvelope): Promise<void>;
+
   /** 会话当前 revision；未知会话返回 null（createSession 用 null sessionId）。 */
   getRevision(sessionId: string): number | null;
   /** 会话当前投影代际；CAS 必须先校验 epoch，再校验 revision。 */
@@ -152,6 +155,7 @@ export class CommandInbox {
           return this.ackOnly(this.retryAck(afterWait));
         }
 
+        await this.host.prepareDecision?.(envelope);
         const decision = this.decide(envelope);
         if (decision.kind === "ack") {
           if (decision.remember) this.rememberSettled(bucketKey, envelope.commandId, decision.ack);
@@ -266,6 +270,16 @@ export class CommandInbox {
     this.settled.delete(bucketKey);
     this.admissionSeq.delete(bucketKey);
     return true;
+  }
+
+  /** 仅供已关闭执行准入并释放旧实例的换代路径；终态事实仍从持久账本回源。 */
+  async resetReleasedSession(sessionId: string): Promise<void> {
+    const bucketKey = this.bucketKey(sessionId);
+    await Promise.all(
+      [...(this.inFlight.get(bucketKey)?.values() ?? [])].map((entry) => entry.final),
+    );
+    this.liveInputs.delete(bucketKey);
+    this.clearSession(sessionId);
   }
 
   private async queryOne(

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createSessionId } from "@zcode/contracts";
 import { AgentRuntime } from "../src/runtime.js";
 import { createTestSessionEventStore } from "./test-event-store.js";
@@ -54,11 +54,15 @@ describe("AgentRuntime prompt admission", () => {
 
     const admission = await runtime.admitPrompt("future turn", undefined, {
       ...admissionOptions("require-queue"),
+      automationId: "automation-queued",
       requireQueue: true,
     });
 
     expect(admission.kind).toBe("queued");
     expect(modelCalls).toBe(0);
+    expect((await runtime.getProjection()).pendingSteerInputs).toEqual([
+      expect.objectContaining({ automationId: "automation-queued" }),
+    ]);
   });
 
   it("reserves before the first turn reaches TurnStarted, so the second prompt is queued", async () => {
@@ -79,7 +83,6 @@ describe("AgentRuntime prompt admission", () => {
 
     if (first.kind !== "started") throw new Error("first prompt was not admitted");
     if (second.kind !== "queued") throw new Error("second prompt was not queued");
-    expect(second.kind).toBe("queued");
     expect(modelCalls).toBeLessThanOrEqual(1);
 
     modelGate.resolve(undefined);

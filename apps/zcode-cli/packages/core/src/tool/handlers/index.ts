@@ -1,4 +1,4 @@
-import { replyToChannelToolEntry } from "./reply-to-channel.js";
+// import { replyToChannelToolEntry } from "./reply-to-channel.js";
 // ============================================================
 // Built-in Tool Handlers
 // ============================================================
@@ -19,6 +19,8 @@ import {
   type JsonSchema,
 } from "@zcode/contracts";
 import type { ToolEntry } from "../types.js";
+import { deferredToolCallEntry } from "./deferred-tool-call.js";
+import { toolSearchToolEntry } from "./tool-search.js";
 import { readToolEntry } from "./read.js";
 import { writeToolEntry } from "./write.js";
 import { editToolEntry } from "./edit.js";
@@ -42,6 +44,7 @@ import {
   cronCreateToolEntry,
   cronDeleteToolEntry,
   cronListToolEntry,
+  cronPauseSelfToolEntry,
   cronUpdateToolEntry,
 } from "./cron.js";
 import { offPeakCreateToolEntry, offPeakListToolEntry } from "./off-peak.js";
@@ -76,6 +79,8 @@ import { createToolRuleNameSet } from "../tool-visibility.js";
 // 统一隐藏 Glob/Grep，并通过 Bash find/grep 接管搜索。
 
 export const builtInTools: ToolEntry[] = [
+  toolSearchToolEntry,
+  deferredToolCallEntry,
   readToolEntry,
   writeToolEntry,
   editToolEntry,
@@ -91,6 +96,7 @@ export const builtInTools: ToolEntry[] = [
   cronListToolEntry,
   cronUpdateToolEntry,
   cronDeleteToolEntry,
+  cronPauseSelfToolEntry,
   offPeakCreateToolEntry,
   offPeakListToolEntry,
   enterPlanModeToolEntry,
@@ -107,7 +113,8 @@ export const builtInTools: ToolEntry[] = [
   taskOutputToolEntry,
   taskStopToolEntry,
   readSessionContextToolEntry,
-  replyToChannelToolEntry,
+  // 渠道回复等待插件入口接入；仅注释默认注册，保留完整实现。
+  // replyToChannelToolEntry,
   agentToolEntry,
   taskToolEntry,
   skillToolEntry,
@@ -118,8 +125,10 @@ export const builtInTools: ToolEntry[] = [
   saveWorkflowToolEntry,
   // workflow 创作的实验通道：同步、只读（v1）、完全瞬态。
   evalWorkflowSnippetToolEntry,
-  // run 内省的两个只读工具：always-on、无 gate。它们不进 WORKFLOW_CHILD_DISALLOWED_TOOLS——
-  // 那条禁令的理由是 CreateWorkflow 的 alwaysAsk 在子 runtime 里无窗可弹，只读查询不适用。
+  // run 内省的两个只读工具：主会话 always-on、无 gate。它们不进 WORKFLOW_CHILD_DISALLOWED_TOOLS——
+  // 那条禁令的理由是 CreateWorkflow 的 alwaysAsk 在子 runtime 里无窗可弹，只读查询不适用；但子
+  // runtime 不持有 run 端口，它们在那里必然失败，所以按另一条规则从子 runtime 移除
+  // （runtime/helpers/tool-allowlist.ts 的 RUN_INTROSPECTION_TOOLS）。
   listWorkflowRunsToolEntry,
   getWorkflowRunToolEntry,
   // run 的恢复入口：与上面两个只读内省工具同族（run_id 键、端口探测失败同款），但它是
@@ -255,7 +264,8 @@ export function registerBuiltInTools(
       (entry.metadata.name === "CronCreate" ||
         entry.metadata.name === "CronList" ||
         entry.metadata.name === "CronUpdate" ||
-        entry.metadata.name === "CronDelete") &&
+        entry.metadata.name === "CronDelete" ||
+        entry.metadata.name === "CronPauseSelf") &&
       options.includeAutomation !== true
     ) {
       continue;

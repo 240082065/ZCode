@@ -3,12 +3,11 @@
 // → BackgroundTaskStarted 事件 → reducer 填充 backgroundWorks → 后台工作面板显示 running →
 // 点取消 → cancelBackgroundWork 命令 → v4-bridge cancelBackgroundTask → 进程被杀 →
 // BackgroundTaskCompleted(cancelled) → 面板状态 cancelled。证明后台工作全链路。
-import {
-  clearAppData,
-} from "../helpers/desktop-app.js";
+import { clearAppData } from "../helpers/desktop-app.js";
 import {
   approveV4Permission,
   clickV4BackgroundWorkCancel,
+  describeV4BackgroundFailureState,
   getV4ComposerBackgroundWorkCounts,
   getLatestV4CommandAck,
   getV4BackgroundWorks,
@@ -28,7 +27,8 @@ describe("v4 M4 门禁：cancelBackgroundWork", () => {
   it("后台 bash 启动 → 面板显示 running → 取消 → cancelled", async function () {
     this.timeout(120000);
     await prepareV4ConversationE2E();
-    await setV4ElectronWindowSize(1280, 900);
+    // 与窄屏共用可容纳的内容高度，只改变待测的宽度断点，避免宿主屏幕截断。
+    await setV4ElectronWindowSize(1280, 800);
 
     // 首轮触发 run_in_background 的 Bash tool_use。若出现权限弹窗则批准（best-effort）。
     await sendV4Prompt("E2E_V4_BGWORK 起一个后台任务");
@@ -40,19 +40,26 @@ describe("v4 M4 门禁：cancelBackgroundWork", () => {
     }
 
     // Composer 入口先暴露当前 session 的 typed running count。
-    await browser.waitUntil(
-      async () => {
-        const counts = await getV4ComposerBackgroundWorkCounts();
-        return (
-          counts?.bashCount === 1 &&
-          counts.subagentCount === 0 &&
-          counts.totalCount === 1 &&
-          counts.typedVisible &&
-          !counts.compactVisible
-        );
-      },
-      { timeout: 60000, timeoutMsg: "Composer 没有显示 running Bash typed count" },
-    );
+    try {
+      await browser.waitUntil(
+        async () => {
+          const counts = await getV4ComposerBackgroundWorkCounts();
+          return (
+            counts?.bashCount === 1 &&
+            counts.subagentCount === 0 &&
+            counts.totalCount === 1 &&
+            counts.typedVisible &&
+            !counts.compactVisible
+          );
+        },
+        { timeout: 60000, timeoutMsg: "Composer 没有显示 running Bash typed count" },
+      );
+    } catch (error) {
+      throw new Error(
+        `Composer 没有显示 running Bash typed count: ${await describeV4BackgroundFailureState()}`,
+        { cause: error },
+      );
+    }
 
     // 窄 Composer 合并为 Activity 总数；点击后 panel 使用 overlay 并直达 Running。
     await setV4ElectronWindowSize(480, 800);
@@ -101,9 +108,9 @@ describe("v4 M4 门禁：cancelBackgroundWork", () => {
     );
     const ack = await getLatestV4CommandAck("cancelBackgroundWork");
     expect(["accepted", "noop"]).toContain(ack?.status);
-    await browser.waitUntil(
-      async () => (await getV4ComposerBackgroundWorkCounts()) === null,
-      { timeout: 30000, timeoutMsg: "最后一个 running task 收口后 Composer 入口仍存在" },
-    );
+    await browser.waitUntil(async () => (await getV4ComposerBackgroundWorkCounts()) === null, {
+      timeout: 30000,
+      timeoutMsg: "最后一个 running task 收口后 Composer 入口仍存在",
+    });
   });
 });

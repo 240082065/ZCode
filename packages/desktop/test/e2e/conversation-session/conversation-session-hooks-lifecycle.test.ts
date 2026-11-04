@@ -11,7 +11,7 @@ import {
   TID_V4_HOOK_DETAILS_CONTENT,
   TID_V4_HOOK_DETAILS_TRIGGER,
   testId,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import {
   clearAppData,
   clickTestIdByDom,
@@ -22,6 +22,7 @@ import {
 import {
   countUpstreamRequests,
   countUpstreamRequestsContaining,
+  getLatestUpstreamToolResultByToolCallId,
   waitForUpstreamRequest,
 } from "../helpers/conversation-session-network.js";
 import { waitForUpstreamNetworkCapture } from "../helpers/upstream-capture.js";
@@ -40,6 +41,7 @@ import {
   readHookTraceRecords,
   processHookRecords,
   restoreHooksLifecycleFixture,
+  toolHookContextText,
   waitForHookScenarioTrace,
   type HookTraceRecord,
 } from "../helpers/hooks-lifecycle-fixture.js";
@@ -50,15 +52,31 @@ import {
   getV4ComposerText,
   prepareV4ConversationE2E,
   sendV4Prompt,
-  startNewV4Draft as startEmptyV4Draft,
   waitForV4AssistantMessageContaining,
   waitForV4Pane,
   waitForV4TimelineContaining,
 } from "../helpers/v4-conversation.js";
+import { openWorkspaceDraftFromSidebar } from "../helpers/workspace-agent-warmup.js";
 
 const STOP_STEP = (index: number) => `${HOOKS_CASE_MARKERS.stopCap}_STEP_${index}`;
+
+// 工具 Hook 的 context 不进工具原文：作为批次后的提醒，每条一个 system-reminder，按顺序相邻；
+// 非 MCS 的 Messages 协议把批次后的提醒并入这批最后一个 tool result，排在工具原文之后。
+async function expectToolHookContextsAfterResult(toolCallId: string, contexts: string[]) {
+  const result = await getLatestUpstreamToolResultByToolCallId(toolCallId);
+  expect(result).not.toBeNull();
+  const reminders = contexts
+    .map((context) => `<system-reminder>\n${context}\n</system-reminder>`)
+    .join("\n\n");
+  const reminderIndex = result!.content.indexOf(`\n\n${reminders}`);
+  expect(reminderIndex).toBeGreaterThan(0);
+  const rawResult = result!.content.slice(0, reminderIndex);
+  for (const context of contexts) expect(rawResult).not.toContain(context);
+  expect(result!.content).not.toContain("[Hook additional context]");
+}
 async function startNewV4Draft() {
-  await startEmptyV4Draft();
+  // 全局新建会分配独立 cwd；本场景的 Hook 文件与轨迹约定属于固定项目目录。
+  await openWorkspaceDraftFromSidebar(DEFAULT_WORKSPACE);
   // Hook 用例不测试默认模型；每份新草稿显式选择，不能依赖旧 Recent 自动回填。
   await selectUpstreamModel();
   await selectUpstreamThoughtLevel();
@@ -127,6 +145,14 @@ describe("Hooks full-chain E2E", () => {
       "Failed Read result did not expose recovery Hook context",
       60000,
     );
+    await expectToolHookContextsAfterResult(HOOKS_TOOL_CALL_IDS.fullWrite, [
+      toolHookContextText("PreToolUse", "Write", HOOKS_CONTEXT.preWrite),
+      toolHookContextText("PostToolUse", "Write", HOOKS_CONTEXT.post),
+    ]);
+    await expectToolHookContextsAfterResult(HOOKS_TOOL_CALL_IDS.fullRead, [
+      toolHookContextText("PreToolUse", "Read", HOOKS_CONTEXT.preRead),
+      toolHookContextText("PostToolUseFailure", "Read", HOOKS_CONTEXT.failure),
+    ]);
 
     expect(await readFile(workspacePath(HOOKS_RELATIVE_PATHS.fullFinal), "utf8")).toBe(
       "permission modified content\n",
@@ -178,6 +204,9 @@ describe("Hooks full-chain E2E", () => {
         `Early failure lost Hook context for ${toolCallId}`,
         60000,
       );
+      await expectToolHookContextsAfterResult(toolCallId, [
+        toolHookContextText("PreToolUse", "Write", context),
+      ]);
     }
     await waitForUpstreamRequest(
       {

@@ -18,7 +18,7 @@
 ## 专用 Key 管理兼容契约
 
 - 个人仍按名称复用 zcode-api-key；同名条目缺少 ID 时失败，不重复创建。团队只复用名称 zcode-team-api-key、keyType=2 且 ID 非空的条目，创建响应也必须满足这三个条件，否则禁止继续换证。无关坏条目不影响有效条目。
-- 管理接口保留旧 Authorization：个人 BigModel 用原始登录 JWT，Z.AI 用 Bearer；团队 customerInfo 同个人，团队列表/创建两 family 均用原始登录 JWT，并保留组织项目头。只有 access_tokens 统一使用 Bearer。
+- customerInfo 两 family 均用原始登录 JWT，和登录身份核验一致，避免 Bearer 格式拒绝被误判为登录失效。Key 列表/创建保留旧 Authorization：个人 BigModel 用原始登录 JWT，Z.AI 用 Bearer；团队两 family 均用原始登录 JWT，并保留组织项目头。access_tokens 统一使用 Bearer。
 - 桌面个人选择非团队项目（projectType 去空白后不为 2），跳过无组织 ID 的候选；Standalone 保留默认机构/默认项目优先、否则首项的规则，不新增项目类型过滤。团队成员归属比较继续去除 ID 两端空白。
 - 项目选择策略由调用端明确传给公共换证客户端，参与内存与持久化 ID 作用域，防止桌面和 CLI 共用记录时覆盖彼此的选择。既有 Token owner、刷新和退出失效时序不变。
 - 验收覆盖错误团队创建响应、无关坏条目、个人同名坏 ID、两 family 管理/签发请求头、混合项目选择和跨策略 ID 隔离。
@@ -57,6 +57,20 @@ Token 不写 Provider Config、Registry、Session、UI 快照、日志或 creden
 ```
 
 账号身份不能取短期 Token 的哈希。桌面 continuous、手机 replayable 和 workspaceIdentity 隔离保持。
+
+### 换证失败错误码
+
+公共换证客户端只向调用方和 observe 事件传播固定错误码，不保留上游 message、cause、URL、响应体或 Token。I/O adapter（Host `readApiJson`、CLI HttpClientPort）负责把请求失败归类为结构化类别，客户端按类别映射：
+
+| 失败类别                                                                                       | 错误码                                                                                 | 是否属于临时故障 |
+| ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ---------------- |
+| 无 HTTP 响应的传输失败（连接、DNS、TLS 等）                                                    | `project_token_network_error`                                                          | 是               |
+| 内部请求超时                                                                                   | `project_token_timeout`                                                                | 是               |
+| HTTP 状态非 2xx（404 除外）                                                                    | `project_token_http_<status>`，例如 `project_token_http_401`、`project_token_http_503` | 仅 429/5xx       |
+| HTTP 404（签发端会先清除 Key ID 位置）；2xx 响应但正文不是 JSON，或 envelope/数据不满足 schema | `project_token_invalid_response`                                                       | 否               |
+| 其他未分类异常                                                                                 | `project_token_request_failed`                                                         | 否               |
+
+是否允许提前刷新复用旧 PAT 仍只看“临时故障”类别，与错误码细分无关；新增错误码只服务日志与 runtime headers 失败文本的诊断，不新增重试、回退或 UI 分支。
 
 ## 长任务与业务登录凭据刷新
 

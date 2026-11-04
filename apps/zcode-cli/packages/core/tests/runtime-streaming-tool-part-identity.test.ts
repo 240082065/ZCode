@@ -12,6 +12,7 @@ import { hydrateMessageHistoryFromSession } from "../src/agent/session-history-h
 import { buildProviderRequestMessages } from "../src/runtime/helpers/provider-request-messages.js";
 import type { AgentRuntimeInternal } from "../src/runtime/internal.js";
 import { createToolRegistry } from "../src/tool/registry.js";
+import type { ToolExecutionContext } from "../src/tool/types.js";
 import { createTestAgentRuntime } from "./test-agent-runtime.js";
 import { createTestSessionEventStore } from "./test-event-store.js";
 import { createRecordingMessageStore } from "./runtime-output-token-continuation-test-helpers.js";
@@ -33,9 +34,11 @@ type FallbackOutcome =
 function createFixture(
   options: {
     outcome?: FallbackOutcome;
+    wrapped?: boolean;
     streamFailure?: boolean;
     earlyWriteFailure?: "pending" | "running" | false;
     delayEarlySchedule?: boolean;
+    recordReadSnapshot?: boolean;
   } = {},
 ) {
   const sessionId = createSessionId("streaming-part-identity");
@@ -52,8 +55,21 @@ function createFixture(
   const releaseSchedule = Promise.withResolvers<void>();
   const lateExecutionSettled = Promise.withResolvers<void>();
   const registry = createToolRegistry();
-  const handler = vi.fn(async () => {
+  const handler = vi.fn(async (_input: unknown, context: ToolExecutionContext) => {
     if (options.outcome === "tool-error") throw new Error(READ_ERROR);
+    if (options.recordReadSnapshot) {
+      context.recordReadFileStateMetadata?.({
+        content: READ_OUTPUT,
+        isPartialView: false,
+        mtimeMs: 1,
+        path: "/tmp/stream-read.txt",
+        readAtMs: 1,
+        revisionId: "rev:stream-read",
+        schemaVersion: 1,
+        sizeBytes: READ_OUTPUT.length,
+        tool: "Read",
+      });
+    }
     return READ_OUTPUT;
   });
   let earlyWriteFailed = false;
@@ -101,6 +117,7 @@ function createFixture(
     },
     metadata: {
       name: "StreamRead",
+      shouldDefer: options.wrapped,
       concurrentSafe: true,
       destructive: false,
       needsApproval: false,
@@ -114,6 +131,7 @@ function createFixture(
     sessionId,
     {
       mode: "yolo",
+      toolSearch: { mode: options.wrapped ? "local" : "off" },
       modelStreaming: "on",
       titleGeneration: { enabled: false },
     },
@@ -125,7 +143,16 @@ function createFixture(
         async *streamText(request) {
           requests.push(request);
           if (requests.length === 1) {
-            yield { type: "tool_call", toolCall: { id: CALL_ID, name: "StreamRead", input: {} } };
+            yield {
+              type: "tool_call",
+              toolCall: options.wrapped
+                ? {
+                    id: CALL_ID,
+                    name: "DeferredToolCall",
+                    input: { name: "StreamRead", input: {} },
+                  }
+                : { id: CALL_ID, name: "StreamRead", input: {} },
+            };
             if (options.delayEarlySchedule) await scheduleStarted.promise;
             else if (options.earlyWriteFailure !== false) await earlyFailure.promise;
             if (options.streamFailure) throw new Error("Model request timed out.");
@@ -242,6 +269,24 @@ describe("streaming tool attempt history", () => {
     },
   );
 
+  it("stores the read-state snapshot index on a result settled from early execution", async () => {
+    const fixture = createFixture({ earlyWriteFailure: false, recordReadSnapshot: true });
+    expect((await fixture.runtime.executeTurn("read a file")).response).toBe("done");
+    expect(fixture.handler).toHaveBeenCalledTimes(1);
+    expect(fixture.parts()).toEqual([
+      expect.objectContaining({
+        id: fixture.writes[0]!.id,
+        declarationIndex: 0,
+        state: expect.objectContaining({
+          status: "completed",
+          metadata: expect.objectContaining({
+            readFileState: expect.objectContaining({ snapshotIndex: expect.any(Number) }),
+          }),
+        }),
+      }),
+    ]);
+  });
+
   it("persists fallback when the first pending write failed", async () => {
     const fixture = createFixture({ earlyWriteFailure: "pending" });
     expect((await fixture.runtime.executeTurn("read a file")).response).toBe("done");
@@ -249,6 +294,30 @@ describe("streaming tool attempt history", () => {
     expect(fixture.parts()).toHaveLength(1);
     expect(fixture.parts()[0]?.id).not.toBe(fixture.writes[0]?.id);
     expectSingleRead(await fixture.hydrate(), false, READ_OUTPUT);
+  });
+
+  it("preserves target part and wrapper model identity during failed stream recovery", async () => {
+    const fixture = createFixture({ wrapped: true, streamFailure: true });
+    await fixture.runtime.executeTurn("call the deferred tool");
+    expect(fixture.handler).not.toHaveBeenCalled();
+    const call = {
+      id: CALL_ID,
+      name: "DeferredToolCall",
+      input: { name: "StreamRead", input: {} },
+    };
+    for (const messages of [fixture.requests[1]!.messages, await fixture.hydrate()]) {
+      expect(messages.flatMap((message) => message.toolCalls ?? [])).toEqual([call]);
+      expect(messages.find((message) => message.role === "tool")).toMatchObject({
+        toolName: "DeferredToolCall",
+        toolCallId: CALL_ID,
+        isError: true,
+      });
+    }
+    expect(fixture.parts().at(-1)).toMatchObject({
+      tool: "StreamRead",
+      metadata: { modelCallWrapper: "DeferredToolCall" },
+      state: { input: {}, status: "error" },
+    });
   });
 
   it("selects the new synthetic result after stream failure", async () => {

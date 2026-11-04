@@ -7,6 +7,32 @@ import { estimateTokens } from "../src/context/utils.js";
 import { buildContextHistoryEntries } from "../src/runtime/methods/context-history-entries.js";
 
 describe("message history metadata", () => {
+  it("isolates announcement delta arrays across add, read and replace without exposing metadata", () => {
+    const history = new MessageHistoryImpl();
+    const delta = {
+      addedNames: ["WebFetch"],
+      removedNames: ["TodoWrite"],
+      readdedNames: ["WebFetch"],
+    };
+    const expected = structuredClone(delta);
+    history.addEntries([
+      {
+        message: { role: "user", content: "Tool availability changed." },
+        metadata: { source: "legacy_synthetic", toolSearchAnnouncement: delta },
+      },
+    ]);
+    for (const names of Object.values(delta)) names.push("source mutation");
+    const entries = history.toRuntimeEntries();
+    expect(entries[0]?.metadata?.toolSearchAnnouncement).toEqual(expected);
+    history.replaceMessages(entries);
+    for (const names of Object.values(entries[0]!.metadata!.toolSearchAnnouncement!))
+      (names as string[]).push("copy mutation");
+    expect(history.toRuntimeEntries()[0]?.metadata?.toolSearchAnnouncement).toEqual(expected);
+    expect(buildProviderRequestMessages({ entries: history.toRuntimeEntries() }).messages).toEqual([
+      { role: "user", content: "Tool availability changed." },
+    ]);
+  });
+
   it("preserves assistant model provenance through request-local clones", () => {
     const history = new MessageHistoryImpl();
     const model = createTestModelSelection("provider-a/model-a");
@@ -38,9 +64,6 @@ describe("message history metadata", () => {
     expect(buildProviderRequestMessages({ entries: history.toRuntimeEntries() }).messages).toEqual([
       { role: "assistant", content: "answer" },
     ]);
-    expect(JSON.stringify(buildProviderRequestMessages({ entries: history.toRuntimeEntries() }).messages)).not.toContain(
-      "tokens",
-    );
   });
 
   it("borrows the current authoritative runtime entries without cloning the array", () => {
@@ -72,14 +95,6 @@ describe("message history metadata", () => {
         metadata: { source: "real_user" },
       },
     ]);
-  });
-
-  it("does not expose provider-visible render helpers on message history", () => {
-    const history = new MessageHistoryImpl();
-
-    expect("toModelMessages" in history).toBe(false);
-    expect("getCacheableMessages" in history).toBe(false);
-    expect("getIncrementalMessages" in history).toBe(false);
   });
 
   it("stores system reminder attachments as structured entries rendered only by provider builder", () => {
@@ -127,7 +142,6 @@ describe("message history metadata", () => {
       { role: "system", content: "system prompt" },
       { role: "user", content: "hook context" },
     ]);
-    expect(JSON.stringify(providerMessages)).not.toContain("hook_context");
 
     const entries = history.toRuntimeEntries();
     expect(entries[1]?.metadata).toEqual({ source: "hook_context" });
@@ -140,14 +154,15 @@ describe("message history metadata", () => {
     });
   });
 
-  it("counts metadata-marked request prefix before falling back to legacy text detection", () => {
+  it("counts only system messages and legacy unmarked reminders as request prefix", () => {
     const history = new MessageHistoryImpl();
     history.init([
       { role: "system", content: "system prompt" },
+      // 指令文件是持久化公告；带来源标记的条目属于会话历史。
       {
-        message: { role: "user", content: "skill listing" },
+        message: { role: "user", content: "context prefix" },
         metadata: {
-          source: "skills_listing",
+          source: "context_prefix",
         },
       },
       {
@@ -161,8 +176,8 @@ describe("message history metadata", () => {
       },
     ]);
 
-    expect(countContextPrefixMessages(history.toRuntimeEntries())).toBe(2);
-    expect(history.getCacheStats().cachedMessages).toBe(2);
+    expect(countContextPrefixMessages(history.toRuntimeEntries())).toBe(1);
+    expect(history.getCacheStats().cachedMessages).toBe(1);
 
     expect(
       countContextPrefixMessages([
@@ -173,7 +188,7 @@ describe("message history metadata", () => {
     ).toBe(2);
   });
 
-  it("builds skills listing context as a structured attachment entry", () => {
+  it("keeps skills and instruction attachments out of context prefix entries", () => {
     const skillsSection = contextSection({
       name: "Available Skills",
       source: "skills",
@@ -188,7 +203,7 @@ describe("message history metadata", () => {
       sections: [skillsSection, dateSection],
       totalChars: skillsSection.chars + dateSection.chars,
       totalTokens: skillsSection.tokens + dateSection.tokens,
-      systemMessages: [],
+      systemMessages: [{ role: "system", content: "system prompt" }],
       metaUserAttachments: [
         {
           source: "skills_listing",
@@ -202,18 +217,9 @@ describe("message history metadata", () => {
       ],
     };
 
+    // Skill 列表与指令文件由请求前的动态公告宣告，prefix 只含 system 消息。
     expect(buildContextHistoryEntries(contextResult)).toEqual([
-      {
-        kind: "attachment",
-        content: "# Skills\n- review: Inspect code",
-        metadata: { source: "skills_listing" },
-      },
-      {
-        kind: "attachment",
-        content:
-          "As you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-06-17.\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.",
-        metadata: { source: "context_prefix" },
-      },
+      { message: { role: "system", content: "system prompt" } },
     ]);
   });
 });

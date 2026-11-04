@@ -45,6 +45,8 @@ export type SessionTaskType = (typeof SESSION_TASK_TYPES)[number];
 export const SESSION_TITLE_SOURCES = ["default", "first_input", "generated", "custom"] as const;
 export type SessionTitleSource = (typeof SESSION_TITLE_SOURCES)[number];
 
+export type SessionLastOutcome = "completed" | "error" | "interrupted";
+
 export const MESSAGE_VISIBILITIES = ["user-visible", "model-only"] as const;
 export type MessageVisibility = (typeof MESSAGE_VISIBILITIES)[number];
 
@@ -157,6 +159,7 @@ export interface SessionInfo {
   titleSource?: SessionTitleSource;
   titleMessageID?: MessageId;
   version: string;
+  lastOutcome?: SessionLastOutcome;
   shareURL?: string;
   summaryAdditions?: number;
   summaryDeletions?: number;
@@ -169,7 +172,7 @@ export interface SessionInfo {
     updated: number;
     titleUpdated?: number;
     compacting?: number;
-    archived?: number;
+    deleted?: number;
   };
 }
 
@@ -246,8 +249,18 @@ export interface ForkCommitBundle {
   };
 }
 
+/**
+ * 同一 session 的多条消息及其 part 按顺序写入，全有或全无。
+ * 用于 compaction 的请求前公告、summary 与附件，以及空闲整批通知（一条消息多个文本 part）。
+ */
+export interface MessageCommitBundle {
+  sessionID: SessionId;
+  messages: MessageWithParts[];
+}
+
 export interface UpdateSessionInput {
   id: SessionId;
+  lastOutcome?: SessionLastOutcome;
   directory?: string;
   path?: string | null;
   timeUpdated?: number;
@@ -265,7 +278,6 @@ export interface UpdateSessionInput {
   revert?: SessionRevert | null;
   permission?: PermissionRuleset | null;
   timeCompacting?: number | null;
-  timeArchived?: number | null;
 }
 
 export interface FileDiff {
@@ -303,7 +315,6 @@ export interface ListSessionsInput {
   path?: string;
   roots?: boolean;
   taskTypes?: SessionTaskType[];
-  includeArchived?: boolean;
   limit?: number;
 }
 
@@ -483,6 +494,8 @@ export interface AttachmentStorageMetadata {
   storageKind?: "inline" | "artifact" | "local_ref" | "remote_ref" | "metadata_only";
   artifactUri?: string;
   originalUrl?: string;
+  /** 路径引用首次发送的完整说明；恢复时原样复用，不能用文件内容 preview 代替。 */
+  pathReferenceText?: string;
   recoverability?: "provider_ready" | "rebuildable" | "preview_only" | "metadata_only" | "missing";
   preview?: {
     text?: string;
@@ -550,6 +563,13 @@ export interface CompactionPart {
     start?: number;
     end?: number;
   };
+  /** 不进入 strict 的 compactBoundary 与 App 协议；旧版本按 JSON 读取时忽略。 */
+  metadata?: CompactionPartMetadata;
+}
+
+export interface CompactionPartMetadata {
+  /** summary 之前的请求前公告；冷恢复放回 summary 之前，切片之后的保留段时跳过。 */
+  compactLeadingMessageIds?: MessageId[];
 }
 
 export type TimelinePartDisplay = "separator" | "worklog";
@@ -813,6 +833,8 @@ export const SESSION_ENTRY_WORKSPACE_FILE_REWIND = "runtime/workspace_file_rewin
 /** 动态工作流工具面已在本会话激活（docs/dynamic-workflow/launch.md「On demand: activation」）。 */
 export const SESSION_ENTRY_DYNAMIC_WORKFLOW_ACTIVATION =
   "runtime/dynamic_workflow_activation" as const;
+/** 本会话用过的能力标签（docs/design/v2/model/session-features-header.md）。 */
+export const SESSION_ENTRY_SESSION_FEATURES = "runtime/session_features" as const;
 
 export const SESSION_ENTRY_TYPES = [
   SESSION_ENTRY_TARGET_COMPLETION_VERIFICATION,
@@ -823,6 +845,7 @@ export const SESSION_ENTRY_TYPES = [
   SESSION_ENTRY_WORKSPACE_CHECKPOINT,
   SESSION_ENTRY_WORKSPACE_FILE_REWIND,
   SESSION_ENTRY_DYNAMIC_WORKFLOW_ACTIVATION,
+  SESSION_ENTRY_SESSION_FEATURES,
 ] as const;
 
 export type SessionEntryType = (typeof SESSION_ENTRY_TYPES)[number];
@@ -1102,8 +1125,18 @@ export interface SessionStorePort {
   /** V4 stable/compact-edit fork 的唯一事务入口。legacy workspace fork 不调用。 */
   commitForkBundle?(bundle: ForkCommitBundle): Promise<SessionInfo>;
   commitSharedContextImportBundle?(bundle: SharedContextImportCommitBundle): Promise<SessionInfo>;
+  /** 一组消息的唯一事务入口；未实现时调用方逐条写入。 */
+  commitMessageBundle?(bundle: MessageCommitBundle): Promise<void>;
   transitionSharedContextImport?(input: SharedContextImportTransition): Promise<boolean>;
   updateSession(input: UpdateSessionInput): Promise<SessionInfo>;
+  /** 只写一次删除时间；正文保留，普通列表永不返回软删除行。 */
+  softDeleteSession?(sessionID: SessionId, timeDeleted?: number): Promise<void>;
+  /** 每个根会话 → 根自身与附属后代（subagent / workflow / 侧边问答，不含 fork）；根不存在为空数组。 */
+  listOwnedSessionTrees?(sessionIDs: SessionId[]): Promise<Map<SessionId, SessionId[]>>;
+  /** 每个目标会话 → part 中仍引用其附件（`zcode-artifact://<目标>/…`）的其他未删除会话；无引用的目标不出现。 */
+  listArtifactReferrers?(sessionIDs: SessionId[]): Promise<Map<SessionId, SessionId[]>>;
+  /** 彻底删除会话及附属后代的全部行；只用于用户确认的「删除数据」，已不存在的会话是空操作。 */
+  purgeSessions?(sessionIDs: SessionId[]): Promise<void>;
   getSession(sessionID: SessionId): Promise<SessionInfo | null>;
   listSessions(input?: ListSessionsInput): Promise<SessionInfo[]>;
   /**

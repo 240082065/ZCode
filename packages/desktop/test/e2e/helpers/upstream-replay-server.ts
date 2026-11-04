@@ -1,6 +1,5 @@
 /* eslint-disable max-lines -- Upstream E2E 回放服务需要集中维护 fixture 匹配、capture artifact、chunk timeline 和 SSE 时间轴回放，拆开会让录制/回放协议更难追踪。 */
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -25,6 +24,7 @@ const LATEST_AGENT_ID_REPLAY_TOKEN = "{{latestAgentId}}";
 const LATEST_BASH_TASK_ID_REPLAY_TOKEN = "{{latestBashTaskId}}";
 const MEMORY_ROOT_REPLAY_TOKEN = "{{memoryRoot}}";
 const LATEST_AUTOMATION_ID_REPLAY_TOKEN = "{{latestAutomationId}}";
+const LATEST_WORKFLOW_RUN_ID_REPLAY_TOKEN = "{{latestWorkflowRunId}}";
 const BROWSER_FIXTURE_URL_REPLAY_TOKEN = "{{browserFixtureUrl}}";
 const LATEST_BROWSER_TAB_ID_REPLAY_TOKEN = "{{latestBrowserTabId}}";
 const LATEST_BROWSER_TAB_A_ID_REPLAY_TOKEN = "{{latestBrowserTabAId}}";
@@ -55,6 +55,7 @@ interface UpstreamReplayFixtureFile {
 type UpstreamReplayCloseMode = "end" | "destroy";
 
 interface UpstreamReplayFixture {
+  metadata?: { timingPolicy?: string };
   captured?: {
     capturedAt?: string;
     model?: string;
@@ -82,6 +83,8 @@ interface UpstreamReplayFixture {
     chunks?: UpstreamReplayResponseChunk[];
     closeMode?: UpstreamReplayCloseMode;
     delayMs?: number;
+    /** 仅 controlled-stream：每个边界均等待测试完成对应操作再释放。 */
+    releaseAfterChunks?: number | number[];
     events?: E2ENetworkCaptureResponseEvent[];
     headers?: Record<string, string>;
     statusCode: number;
@@ -101,6 +104,7 @@ interface ReplayVariables {
   latestBashTaskId?: string;
   memoryRoot?: string;
   latestAutomationId?: string;
+  latestWorkflowRunId?: string;
 }
 
 interface UpstreamReplayResponseChunk {
@@ -143,8 +147,47 @@ export async function startUpstreamReplayServer(
   const fixtures = options.fixturePaths.flatMap((path) =>
     loadFixtureFile(path, options.fixtureVariables),
   );
+  for (const fixture of fixtures) {
+    const boundary = fixture.response.releaseAfterChunks;
+    if (boundary === undefined) continue;
+    const counts = Array.isArray(boundary) ? boundary : [boundary];
+    if (
+      fixture.metadata?.timingPolicy !== "controlled-stream" ||
+      counts.length === 0 ||
+      counts.some(
+        (count, index) =>
+          !Number.isInteger(count) ||
+          count < 1 ||
+          count >= (fixture.response.chunks?.length ?? 0) ||
+          (index > 0 && count <= counts[index - 1]!),
+      ) ||
+      fixture.response.events?.length
+    ) {
+      throw new Error(`无效受控流 fixture: ${fixture.id}；不得改变 recorded/fault stream 的时间轴`);
+    }
+  }
   const fixtureMatchCounts = new Map<string, number>();
   const records: MutableCaptureRecord[] = [];
+  const gates = new Map<string, { release(): void; cancel(): void }>();
+
+  const holdStream = (id: string, response: ServerResponse) =>
+    new Promise<void>((resolveGate, rejectGate) => {
+      if (gates.has(id)) {
+        rejectGate(new Error(`重复的受控请求: ${id}`));
+        return;
+      }
+      const finish = (error?: Error) => {
+        clearTimeout(timer);
+        response.off("close", closed);
+        gates.delete(id);
+        if (error) rejectGate(error);
+        else resolveGate();
+      };
+      const closed = () => finish(new Error(`受控流已断开: ${id}`));
+      const timer = setTimeout(() => finish(new Error(`受控流未被测试释放: ${id}`)), 120_000);
+      gates.set(id, { release: () => finish(), cancel: closed });
+      response.once("close", closed);
+    });
 
   let serverPort = requestedPort;
   let baseUrl = `http://${host}:${serverPort}`;
@@ -172,12 +215,26 @@ export async function startUpstreamReplayServer(
   };
 
   const server = createServer((request, response) => {
+    // 控制端不进入模型请求台账；每个独立 replay server 只释放自己的正在等待的 fixture。
+    if (request.method === "GET" && request.url === "/__e2e__/gates") {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify([...gates.keys()]));
+      return;
+    }
+    if (request.method === "POST" && request.url?.startsWith("/__e2e__/release/")) {
+      const gate = gates.get(request.url.slice("/__e2e__/release/".length));
+      response.statusCode = gate ? 204 : 409;
+      gate?.release();
+      response.end();
+      return;
+    }
     void handleReplayRequest(request, response, {
       baseUrl,
       fixtureMatchCounts,
       fixtures,
       records,
       writeArtifact,
+      holdStream,
     }).catch((error: unknown) => {
       // Bug 根因：旧 handler 是裸 `void Promise`，capture 写入抛错后没有任何人
       // 收口 response，provider 只能一直等 socket。证据通道失败必须显式结束请求。
@@ -214,7 +271,10 @@ export async function startUpstreamReplayServer(
     baseUrl,
     host,
     port: serverPort,
-    stop: () => stopServer(server, writeArtifact),
+    stop: () => {
+      for (const gate of gates.values()) gate.cancel();
+      return stopServer(server, writeArtifact);
+    },
   };
 }
 
@@ -227,6 +287,7 @@ async function handleReplayRequest(
     fixtures: UpstreamReplayFixture[];
     records: MutableCaptureRecord[];
     writeArtifact(): Promise<void>;
+    holdStream(id: string, response: ServerResponse): Promise<void>;
   },
 ) {
   const startedAt = new Date().toISOString();
@@ -303,14 +364,22 @@ async function handleReplayRequest(
     const resolvedBody = resolveFixtureResponseBody(
       fixture.response,
       extractReplayVariables(requestText, requestJson),
+      isStreamingRequest(requestJson),
     );
-    if (resolvedBody.body.includes(BROWSER_FIXTURE_URL_REPLAY_TOKEN)) {
+    if (
+      resolvedBody.body.includes(BROWSER_FIXTURE_URL_REPLAY_TOKEN) ||
+      resolvedBody.body.includes(LATEST_WORKFLOW_RUN_ID_REPLAY_TOKEN)
+    ) {
       // 修复原因：动态 URL marker 缺失或格式错误时保留模板会让 Browser tool
       // 导航到字面量 `{{browserFixtureUrl}}`，随后可能被 compact 摘要掩盖成成功。
       // replay 必须 fail closed，让 fixture/request 契约错误直接可见。
       await writeResponse(response, record, {
         body: JSON.stringify({
-          error: { message: "Missing E2E_BROWSER_FIXTURE_URL replay variable" },
+          error: {
+            message: resolvedBody.body.includes(BROWSER_FIXTURE_URL_REPLAY_TOKEN)
+              ? "Missing E2E_BROWSER_FIXTURE_URL replay variable"
+              : "Missing workflow-hole run ID replay variable",
+          },
         }),
         headers: { "content-type": "application/json; charset=utf-8" },
         statusCode: 500,
@@ -325,6 +394,17 @@ async function handleReplayRequest(
     await writeResponse(response, record, {
       body: resolvedBody.body,
       chunks: fixture.response.chunks,
+      closeMode: fixture.response.closeMode,
+      ...(fixture.response.releaseAfterChunks === undefined
+        ? {}
+        : {
+            releaseAfterChunks: fixture.response.releaseAfterChunks,
+            release: () => {
+              if (fixture.metadata?.timingPolicy !== "controlled-stream")
+                throw new Error("仅 controlled-stream 允许显式释放");
+              return context.holdStream(fixture.id, response);
+            },
+          }),
       headers: resolvedBody.headers,
       statusCode: fixture.response.statusCode,
       statusMessage: fixture.response.statusMessage ?? "OK",
@@ -359,6 +439,7 @@ function closeReplayResponseAfterHandlerError(response: ServerResponse, error: u
 function resolveFixtureResponseBody(
   response: UpstreamReplayFixture["response"],
   variables: ReplayVariables,
+  streaming: boolean,
 ): { body: string; headers: Record<string, string> } {
   if (response.body !== undefined) {
     return {
@@ -367,33 +448,36 @@ function resolveFixtureResponseBody(
     };
   }
 
+  // 修复原因：fixture 的 text/toolUse 简写过去一律渲染为 SSE。标题等 sidecar 请求
+  // 不带 stream:true，真实协议返回 application/json；继续回 SSE 会被回放审计记为
+  // titleResponseFormatErrors。按请求的 stream 属性决定响应格式。
+  // chunks 是录制/受控流的原始字节，存在时必须保持流式，不能被请求属性改写。
+  const streamBody = streaming || (response.chunks?.length ?? 0) > 0;
+  const responseHeaders = streamBody
+    ? withEventStreamHeaders(response.headers)
+    : withJsonHeaders(response.headers);
+
   if (response.toolUses?.length) {
+    const toolUses = response.toolUses.map((toolUse) => resolveReplayToolUse(toolUse, variables));
     return {
-      body: buildToolUsesSseBody(
-        response.toolUses.map((toolUse) => resolveReplayToolUse(toolUse, variables)),
-      ),
-      headers: withEventStreamHeaders(response.headers),
+      body: streamBody ? buildToolUsesSseBody(toolUses) : buildToolUsesMessageBody(toolUses),
+      headers: responseHeaders,
     };
   }
 
   if (response.toolUse) {
+    const toolUse = resolveReplayToolUse(response.toolUse, variables);
     return {
-      body: buildToolUseSseBody(resolveReplayToolUse(response.toolUse, variables)),
-      headers: withEventStreamHeaders(response.headers),
-    };
-  }
-
-  if (response.toolUses?.length) {
-    return {
-      body: buildToolUsesSseBody(response.toolUses),
-      headers: withEventStreamHeaders(response.headers),
+      body: streamBody ? buildToolUseSseBody(toolUse) : buildToolUsesMessageBody([toolUse]),
+      headers: responseHeaders,
     };
   }
 
   if (response.text !== undefined) {
+    const text = resolveReplayText(response.text, variables);
     return {
-      body: buildTextSseBody(resolveReplayText(response.text, variables)),
-      headers: withEventStreamHeaders(response.headers),
+      body: streamBody ? buildTextSseBody(text) : buildTextMessageBody(text),
+      headers: responseHeaders,
     };
   }
 
@@ -401,6 +485,14 @@ function resolveFixtureResponseBody(
     body: "",
     headers: response.headers ?? {},
   };
+}
+
+function isStreamingRequest(requestJson: unknown): boolean {
+  return (
+    typeof requestJson === "object" &&
+    requestJson !== null &&
+    (requestJson as { stream?: unknown }).stream === true
+  );
 }
 
 function extractReplayVariables(requestText: string, requestJson: unknown): ReplayVariables {
@@ -413,6 +505,10 @@ function extractReplayVariables(requestText: string, requestJson: unknown): Repl
     latestBashTaskId: readLatestBashTaskId(requestContent),
     memoryRoot: readMemoryRoot(requestContent),
     latestAutomationId: readLatestAutomationId(requestJson),
+    // Workflow run ID 由真实工具生成；只取最新留白通知，不能把随机 ID 写死在夹具中。
+    latestWorkflowRunId: [
+      ...requestContent.matchAll(/<workflow-hole>[\s\S]*?<run-id>([^<]+)<\/run-id>/gu),
+    ].at(-1)?.[1],
   };
 }
 
@@ -607,6 +703,11 @@ function applyReplayVariablesToString(value: string, variables: ReplayVariables)
   if (variables.latestAutomationId !== undefined) {
     resolved = resolved.split(LATEST_AUTOMATION_ID_REPLAY_TOKEN).join(variables.latestAutomationId);
   }
+  if (variables.latestWorkflowRunId !== undefined) {
+    resolved = resolved
+      .split(LATEST_WORKFLOW_RUN_ID_REPLAY_TOKEN)
+      .join(variables.latestWorkflowRunId);
+  }
   if (variables.browserFixtureUrl !== undefined) {
     resolved = resolved.split(BROWSER_FIXTURE_URL_REPLAY_TOKEN).join(variables.browserFixtureUrl);
   }
@@ -620,6 +721,14 @@ function withEventStreamHeaders(
     "cache-control": "no-cache",
     "content-type": "text/event-stream; charset=utf-8",
     ...headers,
+  };
+}
+
+function withJsonHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+  // 非流式响应的 content-type 必须是权威值；fixture 的 SSE headers 不能带进 JSON 响应。
+  return {
+    ...headers,
+    "content-type": "application/json; charset=utf-8",
   };
 }
 
@@ -750,6 +859,52 @@ function buildTextSseBody(textResponse: UpstreamReplayTextResponse | string): st
   ].join("");
 }
 
+function buildToolUsesMessageBody(toolUses: UpstreamReplayToolUseResponse[]): string {
+  const firstToolUse = toolUses[0];
+  const messageId = firstToolUse?.messageId ?? `msg_${sanitizeSseId(firstToolUse?.name ?? "tool")}`;
+  const inputTokens = firstToolUse?.inputTokens;
+  const outputTokens = toolUses.reduce((sum, toolUse) => sum + (toolUse.outputTokens ?? 16), 0);
+  return JSON.stringify({
+    id: messageId,
+    type: "message",
+    role: "assistant",
+    model: firstToolUse?.model ?? DEFAULT_REPLAY_MODEL,
+    content: toolUses.map((toolUse) => ({
+      type: "tool_use",
+      id: toolUse.id ?? `toolu_${sanitizeSseId(toolUse.name)}`,
+      name: toolUse.name,
+      input: toolUse.input,
+    })),
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    usage: replayUsage(inputTokens, outputTokens),
+  });
+}
+
+function buildTextMessageBody(textResponse: UpstreamReplayTextResponse | string): string {
+  const text = typeof textResponse === "string" ? textResponse : textResponse.text;
+  const id =
+    typeof textResponse === "string"
+      ? "msg_upstream_e2e_text"
+      : (textResponse.id ?? "msg_upstream_e2e_text");
+  const model =
+    typeof textResponse === "string"
+      ? DEFAULT_REPLAY_MODEL
+      : (textResponse.model ?? DEFAULT_REPLAY_MODEL);
+  const inputTokens = typeof textResponse === "string" ? undefined : textResponse.inputTokens;
+  const outputTokens = typeof textResponse === "string" ? undefined : textResponse.outputTokens;
+  return JSON.stringify({
+    id,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: replayUsage(inputTokens, outputTokens ?? 12),
+  });
+}
+
 function replayUsage(inputTokens = 128, outputTokens = 0) {
   return {
     input_tokens: inputTokens,
@@ -777,31 +932,40 @@ async function writeResponse(
   fixtureResponse: {
     body: string;
     chunks?: UpstreamReplayResponseChunk[];
+    closeMode?: UpstreamReplayCloseMode;
+    releaseAfterChunks?: number | number[];
+    release?: () => Promise<void>;
     headers: Record<string, string>;
     statusCode: number;
     statusMessage: string;
   },
 ) {
   const responseChunks = normalizeReplayChunks(fixtureResponse.chunks);
+  const destroyStream = fixtureResponse.closeMode === "destroy";
+  // 同时带 text/chunks 的 fixture 实际发送 chunks，证据也必须记录真正发出的字节。
   const responseBody =
-    fixtureResponse.body.length > 0
-      ? Buffer.from(fixtureResponse.body, "utf-8")
-      : Buffer.concat(responseChunks.map((chunk) => chunk.body));
+    responseChunks.length > 0
+      ? Buffer.concat(responseChunks.map((chunk) => chunk.body))
+      : Buffer.from(fixtureResponse.body, "utf-8");
   const responseHeaders = sanitizeResponseHeaders(fixtureResponse.headers);
-  if (responseChunks.length === 0) {
+  if (responseChunks.length === 0 && !destroyStream) {
     responseHeaders["content-length"] = String(responseBody.length);
   } else {
     delete responseHeaders["content-length"];
   }
   response.writeHead(fixtureResponse.statusCode, fixtureResponse.statusMessage, responseHeaders);
+  let actualOffsets: number[] | undefined;
   if (responseChunks.length > 0) {
-    await writeReplayChunks(response, responseChunks);
-    response.end();
+    // 边界已在加载时统一校验；同一响应逐段创建 gate，释放前一段不预放行后一段。
+    actualOffsets = await writeReplayChunks(response, responseChunks, fixtureResponse);
+    if (!destroyStream) response.end();
+  } else if (destroyStream) {
+    await writeResponseChunk(response, responseBody);
   } else {
     response.end(responseBody);
   }
 
-  record.status = "complete";
+  record.status = destroyStream ? "error" : "complete";
   record.completedAt = new Date().toISOString();
   record.durationMs = durationMs(record.startedAt, record.completedAt);
   record.statusCode = fixtureResponse.statusCode;
@@ -810,26 +974,48 @@ async function writeResponse(
   record.responseHeaders = sanitizeE2ENetworkCaptureHeaders(responseHeaders);
   record.responseTextPreview = redactE2ENetworkCaptureJsonText(responseBody.toString("utf-8"));
   if (responseChunks.length > 0) {
-    record.responseChunkTimeline = responseChunks.map((chunk) => ({
+    record.responseChunkTimeline = responseChunks.map((chunk, index) => ({
       base64: chunk.body.toString("base64"),
       byteLength: chunk.byteLength,
-      offsetMs: chunk.offsetMs,
+      offsetMs: fixtureResponse.release ? actualOffsets![index]! : chunk.offsetMs,
     }));
+  }
+  if (destroyStream) {
+    // chunks/body 与 events 必须执行相同的故障合同；只在 artifact 标 destroy
+    // 却正常 end 会把网络中断测试变成正常 EOF，并制造“产品假完成”的错误结论。
+    record.error = "Replay fixture destroyed SSE response stream";
+    response.destroy();
   }
 }
 
-async function writeReplayChunks(response: ServerResponse, chunks: NormalizedReplayChunk[]) {
+async function writeReplayChunks(
+  response: ServerResponse,
+  chunks: NormalizedReplayChunk[],
+  control?: { releaseAfterChunks?: number | number[]; release?: () => Promise<void> },
+) {
   let previousOffsetMs = 0;
-  for (const chunk of chunks) {
+  const startedAt = Date.now();
+  const actualOffsets: number[] = [];
+  for (const [index, chunk] of chunks.entries()) {
+    const boundary = control?.releaseAfterChunks;
+    if (
+      (Array.isArray(boundary) ? boundary.includes(index) : index === boundary) &&
+      control?.release
+    ) {
+      await control.release();
+      // 只移除被释放的那段人为慢窗口，后续 chunk 间距及内容原样保留。
+      previousOffsetMs = chunk.offsetMs;
+    }
     const delayMs = Math.max(0, chunk.offsetMs - previousOffsetMs);
     if (delayMs > 0) {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
     }
     previousOffsetMs = chunk.offsetMs;
-    if (!response.write(chunk.body)) {
-      await once(response, "drain");
-    }
+    actualOffsets.push(Date.now() - startedAt);
+    // 等待写入完成后再进入下一帧/销毁连接，避免最后一帧只进用户态队列就被丢弃。
+    await writeResponseChunk(response, chunk.body);
   }
+  return actualOffsets;
 }
 
 interface NormalizedReplayChunk {
@@ -926,7 +1112,7 @@ async function writeEventStreamResponse(
   response.end();
 }
 
-function writeResponseChunk(response: ServerResponse, text: string): Promise<void> {
+function writeResponseChunk(response: ServerResponse, text: string | Buffer): Promise<void> {
   return new Promise((resolveWrite, rejectWrite) => {
     response.write(text, (error) => {
       if (error) {

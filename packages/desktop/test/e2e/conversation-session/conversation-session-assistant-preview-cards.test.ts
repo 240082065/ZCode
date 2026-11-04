@@ -1,10 +1,30 @@
-/* eslint-disable max-lines -- APC01-APC12 共用真实 Host stat、Browser/Preview Pane 与 cold-resume fixture。 */
-import { copyFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+/* eslint-disable max-lines -- APC01-APC14 共用真实 Host stat、Browser/Preview Pane 与 cold-resume fixture。 */
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { TID_BROWSER_ADDRESS_INPUT, TID_BROWSER_WEBVIEW, TID_PREVIEW_PANE } from "@zcode/shared";
+import {
+  TID_BROWSER_ADDRESS_INPUT,
+  TID_BROWSER_WEBVIEW,
+  TID_PREVIEW_PANE,
+} from "@zcode/shared/test-ids";
+import type { ChainablePromiseElement } from "webdriverio";
+import type { FileApplicationInfo } from "@zcode/shared";
+import {
+  installFileApplicationMenuProbe,
+  readFileApplicationMenuProbe,
+  restoreFileApplicationMenuProbe,
+} from "../helpers/file-application-menu-probe.js";
 import { clearAppData, DEFAULT_WORKSPACE } from "../helpers/desktop-app.js";
 import { restartIntoWorkspacePreservingProfile } from "../helpers/model-provider-restart.js";
 import {
@@ -76,7 +96,8 @@ describe("Assistant Preview Cards E2E", () => {
     await waitForCompleted(`${marker}_DONE`);
 
     await waitForPreviewCards(["APC Local Preview"]);
-    await clickPreviewCard("APC Local Preview");
+    // APC01 同时验证整卡点击：localhost 网页卡片主体与主按钮触发同一 Browser 预览。
+    await clickPreviewCardBody("APC Local Preview");
     await waitForBrowserSurface(fixtureRootUrl, "APC01_LOCAL_URL_PAGE");
   }).timeout(180_000);
 
@@ -133,6 +154,74 @@ describe("Assistant Preview Cards E2E", () => {
     await expectPreviewCardMissing("旧 说明.md");
     await expectPreviewCardMissing("不存在.pdf");
     await waitForPreviewRenderer("产品 路线.pptx", "pptx");
+    for (const file of OFFICE_FILES) {
+      await assertFileOpenApps(file.name);
+    }
+  }).timeout(240_000);
+
+  it("APC14: unified file menu defaults, first three and More dispatch the selected application", async () => {
+    await prepareCase();
+    await materializeOfficeFixtures();
+    const marker = `${CASE_MARKER}_OFFICE`;
+    await sendV4Prompt(`${marker}_PPTX: report the prepared Office files and one missing PDF.`);
+    await waitForCompleted(`${marker}_PPTX_DONE`);
+    await waitForPreviewCards([...OFFICE_FILES].reverse().map((item) => item.name));
+    await closeSidePanes();
+    const filename = "产品 路线.pptx";
+    const targetPath = await realpath(join(CASE_ROOT, "office", filename));
+    const row = await browser.$(`[data-preview-card-title="${filename}"]`);
+    // 原生候选依平台而变；固定边界使用明确 IPC fixture，不冒充系统枚举或实际启动。
+    for (const count of [0, 1, 3, 10]) {
+      const applications = Array.from({ length: count }, (_, index) => ({
+        id: `apc-app-${index}`,
+        name: `APC Application ${index}`,
+        isDefault: index === count - 1,
+      }));
+      await installFileApplicationMenuProbe(targetPath, applications);
+      try {
+        await assertFileOpenApps(filename, applications);
+        await row.click({ button: "right" });
+        const menu = await browser.$('[data-slot="context-menu-content"][data-state="open"]');
+        await menu.waitForDisplayed();
+        await assertApplicationMenu(menu, applications);
+        const labels = await menu.$$('[role="menuitem"]').map((item) => item.getText());
+        expect(labels[0]).toMatch(/^(Preview|预览)$/);
+        expect(labels.some((label) => /Open containing folder|打开所在目录/.test(label))).toBe(
+          false,
+        );
+        await browser.keys("Escape");
+        // 点击真实预览动作后核对 renderer，而不是直接调用产品回调。
+        await row.click({ button: "right" });
+        await browser
+          .$('[data-slot="context-menu-content"][data-state="open"] [role="menuitem"]')
+          .click();
+        await waitForPreviewRenderer(filename, "pptx");
+        if (count > 3) {
+          await row.$('button[aria-label="Choose app"], button[aria-label="选择打开方式"]').click();
+          const dropdown = await browser.$(
+            '[data-slot="dropdown-menu-content"][data-state="open"]',
+          );
+          await dropdown.$(".file-application-more-trigger").moveTo();
+          const list = await browser.$("[data-file-application-list]");
+          await list.waitForDisplayed();
+          const items = await list.$$('[role="menuitem"]');
+          const last = items[(await items.length) - 1]!;
+          await last.scrollIntoView();
+          await last.click();
+          await browser.waitUntil(async () => (await readFileApplicationMenuProbe()).length === 1, {
+            timeout: 10_000,
+          });
+          const [call] = await readFileApplicationMenuProbe();
+          expect(call?.applicationId).toBe("apc-app-8");
+          expect(call?.target.path).toBe(targetPath);
+          expect(call?.target.pathKind).toBe("file");
+        }
+      } finally {
+        await browser.keys("Escape");
+        await browser.keys("Escape");
+        await restoreFileApplicationMenuProbe();
+      }
+    }
   }).timeout(240_000);
 
   it("APC12: 独立音频消息打开原生 audio 播放器", async () => {
@@ -155,6 +244,7 @@ describe("Assistant Preview Cards E2E", () => {
     await sendV4Prompt(`${marker}: report the prepared video file only.`);
     await waitForCompleted(`${marker}_DONE`);
     await waitForPreviewCards(["生成 视频.mp4"]);
+    await assertFileOpenApps("生成 视频.mp4");
     const logSnapshot = await snapshotDesktopRuntimeLogs();
     await clickPreviewCard("生成 视频.mp4");
     await waitForPreviewRenderer("生成 视频.mp4", "video");
@@ -289,7 +379,7 @@ async function readPreviewCards(
 ): Promise<PreviewCardSnapshot[]> {
   return browser.execute(
     (titles) => {
-      const openLabels = new Set(["Open", "打开"]);
+      const openLabels = new Set(["Open", "打开", "Preview", "预览"]);
       return Array.from(
         document.querySelectorAll<HTMLElement>('[data-zcode-stream-animate="true"]'),
       )
@@ -332,7 +422,7 @@ async function expectPreviewCardMissing(title: string) {
 
 async function clickPreviewCard(title: string) {
   const result = await browser.execute((expectedTitle) => {
-    const openLabels = new Set(["Open", "打开"]);
+    const openLabels = new Set(["Open", "打开", "Preview", "预览"]);
     const row = Array.from(
       document.querySelectorAll<HTMLElement>('[data-zcode-stream-animate="true"]'),
     ).find((candidate) => candidate.innerText.includes(expectedTitle));
@@ -346,18 +436,127 @@ async function clickPreviewCard(title: string) {
   expect(result.disabled).toBe(false);
 }
 
+// 卡片主体整卡可点：点击标题区域（铺满卡片的透明按钮）与主按钮执行同一预览动作。
+async function clickPreviewCardBody(title: string) {
+  const result = await browser.execute((expectedTitle) => {
+    const row = document.querySelector<HTMLElement>(
+      `[data-preview-card-title="${expectedTitle}"]`,
+    );
+    const overlay = Array.from(row?.querySelectorAll<HTMLButtonElement>("button") ?? []).find(
+      (button) => (button.getAttribute("aria-label") ?? "").endsWith(expectedTitle),
+    );
+    overlay?.click();
+    return { clicked: Boolean(overlay), disabled: Boolean(overlay?.disabled) };
+  }, title);
+  expect(result.clicked).toBe(true);
+  expect(result.disabled).toBe(false);
+}
+
+async function assertApplicationMenu(
+  menu: ChainablePromiseElement,
+  applications: FileApplicationInfo[],
+) {
+  const unique = [...new Map(applications.map((app) => [app.id, app])).values()];
+  const ordered = [
+    ...unique.filter((app) => app.isDefault),
+    ...unique.filter((app) => !app.isDefault),
+  ];
+  await browser.waitUntil(
+    async () => {
+      const ids = await menu
+        .$$("[data-file-application-direct]")
+        .map((item) => item.getAttribute("data-file-application-direct"));
+      const text = await menu.getText();
+      return (
+        JSON.stringify(ids) === JSON.stringify(ordered.slice(0, 3).map((app) => app.id)) &&
+        !/^(Loading|加载中)[….]*$/m.test(text)
+      );
+    },
+    { timeout: 10_000, timeoutMsg: "File applications did not match the bound target" },
+  );
+  const direct = await menu.$$("[data-file-application-direct]");
+  for (let index = 0; index < (await direct.length); index++) {
+    const label = await direct[index]!.getText();
+    expect(label).toContain(ordered[index]!.name);
+    if (ordered[index]!.isDefault) expect(label).toMatch(/Open in|在.*中打开/);
+    expect(
+      await direct[index]!.$(
+        '[data-slot="file-application-icon"], [data-slot="file-application-icon-fallback"]',
+      ).isExisting(),
+    ).toBe(true);
+  }
+  const text = await menu.getText();
+  expect(text).toMatch(/Save as|另存为/i);
+  expect(text).toMatch(/Copy absolute path|复制绝对路径/);
+  if (ordered.length === 0) expect(text).toMatch(/Open with default app|使用默认应用打开/);
+  const more = await menu.$(".file-application-more-trigger");
+  expect(await more.isExisting()).toBe(ordered.length > 3);
+  if (ordered.length > 3) {
+    await more.moveTo();
+    const list = await browser.$("[data-file-application-list]");
+    await list.waitForDisplayed();
+    const labels = await list.$$('[role="menuitem"]').map((item) => item.getText());
+    expect(labels).toEqual(ordered.slice(3).map((app) => app.name));
+    if (ordered.length > 9) {
+      const dimensions = await list.getSize();
+      expect(dimensions.height).toBeLessThanOrEqual(179);
+    }
+    await browser.keys("Escape");
+  }
+}
+
+async function assertFileOpenApps(filename: string, fixture?: FileApplicationInfo[]) {
+  // Office 夹具位于 office/，不能按 CASE_ROOT 根目录查找；必须查询卡片对应的同一个真实文件。
+  const filePath = await realpath(
+    join(
+      CASE_ROOT,
+      OFFICE_FILES.some((file) => file.name === filename) ? "office" : "media",
+      filename,
+    ),
+  );
+  const expected =
+    fixture ??
+    (await browser.execute(async (filePath) => {
+      const platform = (
+        window as unknown as Window & {
+          zcode: {
+            getFileApplications(target: {
+              path: string;
+              pathKind: "file";
+            }): Promise<FileApplicationInfo[]>;
+          };
+        }
+      ).zcode;
+      return platform.getFileApplications({ path: filePath, pathKind: "file" });
+    }, filePath));
+  const row = await browser.$(`[data-preview-card-title="${filename}"]`);
+  await row.$('button[aria-label="Choose app"], button[aria-label="选择打开方式"]').click();
+  const menu = await browser.$('[data-slot="dropdown-menu-content"][data-state="open"]');
+  await menu.waitForDisplayed();
+  try {
+    await assertApplicationMenu(menu, expected);
+    expect(await menu.getText()).toMatch(/Copy relative path|复制相对路径/);
+  } finally {
+    await browser.keys("Escape");
+  }
+}
+
 async function assertLocalHtmlExternalOpen() {
   const openPath = await browser.electron.mock("shell", "openPath");
   await openPath.mockResolvedValue("");
   try {
     const expectedTitle = basename(SOURCE_HTML_RELATIVE_PATH);
     const rows = await browser.$$('[data-zcode-stream-animate="true"]');
-    const row = (await rows.map(async (candidate) => ({
-      candidate,
-      text: await candidate.getText(),
-    }))).find(({ text }) => text.includes(expectedTitle))?.candidate;
+    const row = (
+      await rows.map(async (candidate) => ({
+        candidate,
+        text: await candidate.getText(),
+      }))
+    ).find(({ text }) => text.includes(expectedTitle))?.candidate;
     expect(row).toBeDefined();
-    const trigger = await row?.$('button[aria-label="Choose app"], button[aria-label="选择打开方式"]');
+    const trigger = await row?.$(
+      'button[aria-label="Choose app"], button[aria-label="选择打开方式"]',
+    );
     expect(trigger).toBeDefined();
     await trigger?.click();
 
@@ -365,10 +564,12 @@ async function assertLocalHtmlExternalOpen() {
       async () => {
         const labels = new Set(["Open in browser", "在浏览器中打开"]);
         const items = await browser.$$('[role="menuitem"]');
-        const item = (await items.map(async (candidate) => ({
-          candidate,
-          text: await candidate.getText(),
-        }))).find(({ text }) => labels.has(text.trim()))?.candidate;
+        const item = (
+          await items.map(async (candidate) => ({
+            candidate,
+            text: await candidate.getText(),
+          }))
+        ).find(({ text }) => labels.has(text.trim()))?.candidate;
         if (!item) return false;
         await item.click();
         return true;
@@ -504,7 +705,11 @@ async function waitForPreviewRenderer(
           }
           return {
             hasError,
-            header: text.split("\n")[0] ?? "",
+            // 文件管理器把预览标题 portal 到共同头部；不能在预览正文里找文件名。
+            header:
+              pane?.closest("[data-file-manager-pane]")?.firstElementChild?.textContent ??
+              text.split("\n")[0] ??
+              "",
             ready,
             text,
           };
@@ -513,7 +718,7 @@ async function waitForPreviewRenderer(
         filename,
         renderer,
       );
-      return !latest.hasError && latest.text.includes(filename) && latest.ready;
+      return !latest.hasError && latest.header.includes(filename) && latest.ready;
     },
     {
       timeout: 90_000,
@@ -575,6 +780,11 @@ async function assertPreviewVideoSurvivesResizeAndFullscreen() {
 }
 
 async function assertSourcePreviewTargets() {
+  // 整卡点击（标题区域透明按钮）与主按钮路径先后各验证一次，防止整卡可点回归退化为仅按钮可点。
+  await clickPreviewCardBody(basename(SOURCE_MARKDOWN_RELATIVE_PATH));
+  await waitForPreviewRenderer(basename(SOURCE_MARKDOWN_RELATIVE_PATH), "markdown");
+  await closePreviewPane();
+
   await clickPreviewCard(basename(SOURCE_MARKDOWN_RELATIVE_PATH));
   await waitForPreviewRenderer(basename(SOURCE_MARKDOWN_RELATIVE_PATH), "markdown");
   await closePreviewPane();

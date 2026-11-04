@@ -1,3 +1,5 @@
+import type { ModelToolReferenceContentBlock } from "../tools/tool-search.js";
+import { zcodeProviderRuntimeHeadersErrorCode } from "@zcode/shared";
 // ============================================================
 // Model Protocol - provider-neutral model contracts
 // ============================================================
@@ -107,6 +109,7 @@ export const ModelErrorCode = {
   InvalidModelResponse: "invalid_model_response",
   ModelRequestFailed: "model_request_failed",
   ModelRequestAuthMissing: "model_request_auth_missing",
+  ModelRequestVerificationConfigNetwork: zcodeProviderRuntimeHeadersErrorCode.configNetwork,
   ModelRequestCancelled: "model_request_cancelled",
   ModelRequestTimeout: "model_request_timeout",
   ModelRateLimited: "model_rate_limited",
@@ -227,6 +230,8 @@ export interface ModelRequestCompletedStatusEvent extends ModelNetworkStatusBase
 
 export interface ModelRequestFailedStatusEvent extends ModelNetworkStatusBase {
   type: "model_request_failed";
+  /** Provider 已报告的失败请求用量；不为失败响应伪造成功完成事件。 */
+  usage?: ModelUsage;
   durationMs?: number;
   reason: ModelFailureReason;
   retryable: boolean;
@@ -401,6 +406,7 @@ export interface ModelResourceLinkContentBlock {
 }
 
 export type ModelMessageContentBlock =
+  | ModelToolReferenceContentBlock
   | ModelTextContentBlock
   | ModelReasoningContentBlock
   | ModelImageContentBlock
@@ -440,6 +446,8 @@ export function modelMessageContentBlockToText(block: ModelMessageContentBlock):
       return block.text;
     case "reasoning":
       return "";
+    case "tool_reference":
+      return block.toolName;
     case "image":
       return attachmentPlaceholder("Attached", block.mediaType, block.source?.placeholder);
     case "video":
@@ -477,6 +485,7 @@ export type ModelToolSideEffectScope =
   | "userInteraction";
 
 export interface ModelToolContract {
+  deferLoading?: boolean;
   name: string;
   description?: string;
   capability?: string;
@@ -651,6 +660,7 @@ export interface ModelRequestSettings {
 }
 
 export interface ModelTextRequest extends ModelRequestSettings {
+  toolSearchEnabled?: boolean;
   messages: ModelInputMessage[];
   tools?: ModelToolContract[];
   toolChoice?: ModelToolChoice;
@@ -815,6 +825,17 @@ export type ModelStreamEvent =
       toolCall: ModelToolCall;
     }
   | {
+      /**
+       * Provider 在服务端执行完内置工具（toolCall.providerExecuted）后随流下发的结果。
+       * 客户端不执行这类工具，只用于展示、持久化和下一次请求回放。
+       */
+      type: "provider_tool_result";
+      toolCallId: string;
+      toolName: string;
+      output: unknown;
+      isError: boolean;
+    }
+  | {
       type: "finish";
       finishReason: string;
       providerMetadata?: Record<string, unknown>;
@@ -861,6 +882,15 @@ const attachmentRefJsonSchema = {
 
 const modelMessageContentBlockJsonSchema = {
   oneOf: [
+    {
+      type: "object",
+      required: ["type", "toolName"],
+      additionalProperties: false,
+      properties: {
+        type: { enum: ["tool_reference"] },
+        toolName: { type: "string", minLength: 1 },
+      },
+    },
     {
       type: "object",
       required: ["type", "text"],

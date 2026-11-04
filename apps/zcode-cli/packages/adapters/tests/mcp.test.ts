@@ -1,4 +1,4 @@
-import { dirname } from "node:path";
+import { delimiter, dirname } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UnauthorizedError } from "@modelcontextprotocol/client";
 import { ZCODE_TOOL_ENV_PASSTHROUGH_ENV_KEY } from "@zcode/shared";
@@ -118,7 +118,14 @@ import { createMcpTelemetryTracker } from "../src/mcp/telemetry.js";
  * 修复原因：授权 URL 的归属已经从「Phase 1 provider 自己 redirect」改为「Phase 2 事务发布」，
  * 所以这些用例必须走 connect 失败 → 分类 → Phase 2 这条新链路。
  */
-function stubInteractiveAuthorization(authorizationUrl: string): { release: () => void } {
+function stubInteractiveAuthorization(
+  authorizationUrl: string,
+  beforeAuthorization?: Promise<void>,
+): { release: () => void; ready: Promise<void> } {
+  let markReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -133,11 +140,13 @@ function stubInteractiveAuthorization(authorizationUrl: string): { release: () =
     const interactiveProvider = provider as {
       redirectToAuthorization(url: URL): Promise<void>;
     };
+    await beforeAuthorization;
     await interactiveProvider.redirectToAuthorization(new URL(authorizationUrl));
+    markReady();
     await gate;
     return "AUTHORIZED" as const;
   });
-  return { release };
+  return { release, ready };
 }
 
 async function observePromiseWithin<T>(
@@ -191,6 +200,83 @@ describe("createMcpAdapter", () => {
     });
   });
 
+  it("close waits for cancelled handshake resource cleanup before returning", async () => {
+    const started = Promise.withResolvers<void>();
+    const cleanupStarted = Promise.withResolvers<void>();
+    const cleaned = Promise.withResolvers<void>();
+    clientConnectMock.mockImplementationOnce(async () => {
+      started.resolve();
+      await new Promise(() => {});
+    });
+    clientCloseMock.mockImplementationOnce(async () => {
+      cleanupStarted.resolve();
+      await cleaned.promise;
+    });
+    const adapter = createMcpAdapter();
+    const connecting = adapter.connectServer("slow", {
+      type: "http",
+      url: "https://mcp.example.test/mcp",
+    });
+    await started.promise;
+    let settled = false;
+    const closing = adapter.close().then(() => {
+      settled = true;
+    });
+    await cleanupStarted.promise;
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(settled).toBe(false);
+    cleaned.resolve();
+    await closing;
+    await connecting;
+    expect(await adapter.status()).toEqual({});
+  });
+
+  it("waits for the existing App connection without exposing a premature snapshot or reconnecting", async () => {
+    const gate = Promise.withResolvers<void>();
+    clientConnectMock.mockImplementationOnce(() => gate.promise);
+    const adapter = createMcpAdapter();
+    const connecting = adapter.connectServer("fixture", { type: "stdio", command: "node" });
+    await vi.waitFor(() => expect(clientConnectMock).toHaveBeenCalledOnce());
+    expect(adapter.appConnectionSnapshot?.("fixture")).toBeNull();
+    const settled = vi.fn();
+    const opening = adapter.waitForAppConnection!("fixture").then(settled);
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    gate.resolve();
+    await connecting;
+    await opening;
+    expect(settled).toHaveBeenCalledWith(adapter.appConnectionSnapshot?.("fixture"));
+    expect(settled.mock.calls[0]?.[0]).not.toBeNull();
+    expect(clientConnectMock).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("does not issue an App connection for an absent or failed server", async () => {
+    const adapter = createMcpAdapter();
+    expect(await adapter.waitForAppConnection!("missing")).toBeNull();
+    clientConnectMock.mockRejectedValueOnce(new Error("fixture startup failure"));
+    await adapter.connectServer("fixture", { type: "stdio", command: "node" });
+    expect(await adapter.waitForAppConnection!("fixture")).toBeNull();
+    expect(clientConnectMock).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("rejects an App startup waiter after the connection generation is replaced", async () => {
+    const gate = Promise.withResolvers<void>();
+    clientConnectMock.mockImplementationOnce(() => gate.promise);
+    const adapter = createMcpAdapter();
+    const config = { type: "stdio" as const, command: "node" };
+    const connecting = adapter.connectServer("fixture", config);
+    await vi.waitFor(() => expect(clientConnectMock).toHaveBeenCalledOnce());
+    const opening = adapter.waitForAppConnection!("fixture");
+    await adapter.connectServer("fixture", config);
+    gate.resolve();
+    await connecting;
+    expect(await opening).toBeNull();
+    expect(adapter.appConnectionSnapshot?.("fixture")).not.toBeNull();
+    await adapter.close();
+  });
+
   it("forwards runtime scope, session, turn, and trace context through MCP request metadata", async () => {
     const adapter = createMcpAdapter();
     await adapter.connectServer("node_repl", {
@@ -235,6 +321,30 @@ describe("createMcpAdapter", () => {
       },
       expect.objectContaining({ resetTimeoutOnProgress: true }),
     );
+  });
+
+  it("forwards the root session of a subagent call through MCP request metadata", async () => {
+    const adapter = createMcpAdapter();
+    await adapter.connectServer("node_repl", { command: "node", type: "stdio" });
+
+    await adapter.callTool({
+      arguments: { code: "1 + 1" },
+      serverName: "node_repl",
+      toolName: "js",
+      runtimeScope: "subagent",
+      trace: {
+        rootSessionId: "session-1" as never,
+        sessionId: "subagent-1" as never,
+        traceId: "trace-1" as never,
+      },
+    });
+
+    const meta = clientCallToolMock.mock.calls.at(-1)?.[0]._meta;
+    expect(meta).toMatchObject({ root_session_id: "session-1", session_id: "subagent-1" });
+    expect(meta["com.zcode/request-context"]).toMatchObject({
+      root_session_id: "session-1",
+      session_id: "subagent-1",
+    });
   });
 
   it("uses the injected client version for MCP initialize", async () => {
@@ -817,6 +927,29 @@ describe("createMcpAdapter", () => {
     });
   });
 
+  it("appends the injected node fallback after the server env", async () => {
+    const resolve = vi.fn(async () => ({
+      binDir: "/fallback/bin",
+      env: { ZCODE_NODE_FALLBACK_EXEC_PATH: "/electron" },
+    }));
+    const adapter = createMcpAdapter({
+      env: { PATH: dirname(process.execPath) },
+      nodeFallback: { resolve },
+    });
+
+    await adapter.connectServer("demo", {
+      command: "node",
+      // 插件自带 PATH 会整体替换宿主 PATH；fallback 仍须追加在它后面。
+      env: { PATH: "/plugin/bin" },
+      type: "stdio",
+    });
+
+    const options = capturedStdioOptions[0] as { env?: Record<string, string> };
+    expect(options.env?.PATH).toBe(["/plugin/bin", "/fallback/bin"].join(delimiter));
+    expect(options.env?.ZCODE_NODE_FALLBACK_EXEC_PATH).toBe("/electron");
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
   it("restores captured user network env into stdio MCP transports", async () => {
     const adapter = createMcpAdapter({
       env: {
@@ -1173,56 +1306,62 @@ describe("createMcpAdapter", () => {
   });
 
   it("treats per-connect OAuth authorization timeout as a caller budget, not a transaction kill", async () => {
-    const { release } = stubInteractiveAuthorization(
+    let startAuthorization!: () => void;
+    const beforeAuthorization = new Promise<void>((resolve) => {
+      startAuthorization = resolve;
+    });
+    const { release, ready } = stubInteractiveAuthorization(
       "https://auth.example.test/authorize?state=state_test",
+      beforeAuthorization,
     );
     const adapter = createMcpAdapter();
     const startedAt = Date.now();
-
-    const status = await adapter.connectServer(
-      "notion",
-      {
-        type: "http",
-        url: "https://mcp.example.test/mcp",
-        timeoutMs: 2_000,
-        oauth: {
-          type: "authorization_code",
-          clientName: "ZCode",
+    try {
+      const status = await adapter.connectServer(
+        "notion",
+        {
+          type: "http",
+          url: "https://mcp.example.test/mcp",
+          timeoutMs: 2_000,
+          oauth: { type: "authorization_code", clientName: "ZCode" },
         },
-      },
-      {
-        oauthAuthorizationTimeoutMs: 20,
-      },
-    );
-
-    // Bug 回归（分析文档的一句话根因）：过去 `oauthAuthorizationTimeoutMs` 被当成 OAuth 事务
-    // 寿命，20ms 后连接被判 failed、callback listener 被关闭，真人根本来不及授权（现场一次成功
-    // 授权耗时约 74 秒）。现在它只是 caller 的等待预算：到点返回当时的 snapshot——仍是
-    // connecting 且带授权 URL——后台授权事务继续存活。
-    expect(status).toMatchObject({
-      authorization: {
-        authorizationUrl: "https://auth.example.test/authorize?state=state_test",
-      },
-      status: "connecting",
-    });
-    // 预算只约束等待，不把 MCP 的 2 秒协议超时也拖进来。
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
-    // Phase 2 完全不走 transport.finishAuth：授权由 SDK 的 `auth()` 直接驱动。
-    expect(transportFinishAuthMock).not.toHaveBeenCalled();
-
-    release();
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const current = await adapter.status();
-      if (current.notion?.status === "connected") break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+        { oauthAuthorizationTimeoutMs: 20 },
+      );
+      // URL 发布含异步存储，不能假定它比 20ms caller 预算更快；事务应在 caller 返回后继续。
+      expect(status).toMatchObject({ status: "connecting" });
+      expect(status.authorization).toBeUndefined();
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+      expect(transportFinishAuthMock).not.toHaveBeenCalled();
+      startAuthorization();
+      await ready;
+      await expect(adapter.status()).resolves.toMatchObject({
+        notion: {
+          authorization: {
+            authorizationUrl: "https://auth.example.test/authorize?state=state_test",
+          },
+          status: "connecting",
+        },
+      });
+      release();
+      await vi.waitFor(async () => {
+        expect(await adapter.status()).toMatchObject({ notion: { status: "connected" } });
+      });
+    } finally {
+      startAuthorization();
+      release();
+      await adapter.close();
     }
-    await expect(adapter.status()).resolves.toMatchObject({
-      notion: { status: "connected" },
-    });
-    await adapter.close();
   });
 
   it("keeps runtime OAuth recovery alive after the triggering caller times out", async () => {
+    let startAuthorization!: () => void;
+    const beforeAuthorization = new Promise<void>((resolve) => {
+      startAuthorization = resolve;
+    });
+    let markReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      markReady = resolve;
+    });
     let releaseAuthorization!: () => void;
     const authorizationGate = new Promise<void>((resolve) => {
       releaseAuthorization = resolve;
@@ -1234,7 +1373,9 @@ describe("createMcpAdapter", () => {
       };
       const authorizationUrl = new URL("https://auth.example.test/authorize");
       authorizationUrl.searchParams.set("state", await interactiveProvider.state());
+      await beforeAuthorization;
       await interactiveProvider.redirectToAuthorization(authorizationUrl);
+      markReady();
       await authorizationGate;
       return "AUTHORIZED" as const;
     });
@@ -1266,6 +1407,9 @@ describe("createMcpAdapter", () => {
         },
         status: "rejected",
       });
+      // 显式让 caller 先超时，再发布 URL，避免靠机器负载决定断言先后。
+      startAuthorization();
+      await ready;
       await expect(adapter.status()).resolves.toMatchObject({
         runtime: {
           authorization: {
@@ -1300,6 +1444,7 @@ describe("createMcpAdapter", () => {
       // 原 caller 已经超时，后台 recovery 只负责重连；不会替超时 caller 再执行工具。
       expect(clientCallToolMock).toHaveBeenCalledTimes(2);
     } finally {
+      startAuthorization();
       releaseAuthorization();
       await Promise.allSettled([call]);
       await adapter.close();
@@ -1530,146 +1675,6 @@ describe("createMcpAdapter", () => {
     } finally {
       await adapter.close();
     }
-  });
-
-  it("only opens OAuth authorization URL when an opener is injected", async () => {
-    const openAuthorizationUrl = vi.fn(async () => {});
-    const { release: resolveConnect } = stubInteractiveAuthorization(
-      "https://auth.example.test/authorize?state=state_test",
-    );
-    const adapter = createMcpAdapter({
-      mcpOAuth: {
-        openAuthorizationUrl,
-      },
-    });
-
-    const connect = adapter.connectServer("notion", {
-      type: "http",
-      url: "https://mcp.example.test/mcp",
-      oauth: {
-        type: "authorization_code",
-        clientName: "ZCode",
-      },
-    });
-
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const status = await adapter.status();
-      if (status.notion?.authorization?.authorizationUrl) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-
-    expect(openAuthorizationUrl).toHaveBeenCalledWith(
-      expect.objectContaining({
-        authorizationUrl: "https://auth.example.test/authorize?state=state_test",
-        serverName: "notion",
-      }),
-    );
-
-    resolveConnect();
-    await expect(connect).resolves.toMatchObject({
-      status: "connected",
-      toolCount: 0,
-    });
-    await adapter.close();
-  });
-
-  it("passes OAuth client credentials providers into HTTP and SSE MCP transports", async () => {
-    const adapter = createMcpAdapter({
-      clientName: "zcode-test",
-    });
-
-    await adapter.connectServer("http-demo", {
-      type: "http",
-      url: "https://mcp.example.test",
-      headers: {
-        "X-ZCode": "1",
-      },
-      oauth: {
-        type: "client_credentials",
-        clientId: "http-client",
-        clientSecret: "http-secret",
-        scope: "mcp:tools",
-      },
-    });
-    await adapter.connectServer("sse-demo", {
-      type: "sse",
-      url: "https://mcp.example.test/sse",
-      oauth: {
-        type: "client_credentials",
-        clientId: "sse-client",
-        clientSecret: "sse-secret",
-      },
-    });
-
-    const httpOptions = capturedHttpOptions[0] as {
-      authProvider?: {
-        clientInformation(): { client_id: string; client_secret?: string };
-        clientMetadata: {
-          client_name?: string;
-          grant_types?: string[];
-          scope?: string;
-        };
-      };
-      requestInit?: { headers?: Record<string, string> };
-    };
-    const sseOptions = capturedSseOptions[0] as {
-      authProvider?: {
-        clientInformation(): { client_id: string; client_secret?: string };
-        clientMetadata: { client_name?: string; grant_types?: string[] };
-      };
-    };
-
-    expect(httpOptions.requestInit?.headers).toEqual({ "X-ZCode": "1" });
-    expect(httpOptions.authProvider?.clientInformation()).toEqual({
-      client_id: "http-client",
-      client_secret: "http-secret",
-    });
-    expect(httpOptions.authProvider?.clientMetadata).toMatchObject({
-      client_name: "zcode-test-http-demo",
-      grant_types: ["client_credentials"],
-      scope: "mcp:tools",
-    });
-    expect(sseOptions.authProvider?.clientInformation()).toEqual({
-      client_id: "sse-client",
-      client_secret: "sse-secret",
-    });
-    expect(sseOptions.authProvider?.clientMetadata).toMatchObject({
-      client_name: "zcode-test-sse-demo",
-      grant_types: ["client_credentials"],
-    });
-  });
-
-  it("exposes pending OAuth authorization URL through server status", async () => {
-    const { release: resolveConnect } = stubInteractiveAuthorization(
-      "https://auth.example.test/authorize?state=state_test",
-    );
-    const adapter = createMcpAdapter();
-
-    const connect = adapter.connectServer("notion", {
-      type: "http",
-      url: "https://mcp.example.test/mcp",
-      oauth: {
-        type: "authorization_code",
-        clientName: "ZCode",
-      },
-    });
-
-    let authorizationUrl: string | undefined;
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const status = await adapter.status();
-      authorizationUrl = status.notion?.authorization?.authorizationUrl;
-      if (authorizationUrl) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-
-    expect(authorizationUrl).toBe("https://auth.example.test/authorize?state=state_test");
-
-    resolveConnect();
-    await expect(connect).resolves.toMatchObject({
-      status: "connected",
-      toolCount: 0,
-    });
-    await adapter.close();
   });
 
   it("only opens OAuth authorization URL when an opener is injected", async () => {

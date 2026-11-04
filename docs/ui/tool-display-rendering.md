@@ -23,10 +23,26 @@
 
 ## 会话流可见性
 
+- `DeferredToolCall` 在 `inputStreaming` 阶段尚未确认目标工具，不渲染临时卡片或空白占位，也不从半截包装参数推测目标。完整调用经 Core 确认后，同一行按目标名称复用原 renderer 和显示设置；关闭“显示待办”时，包装的 TodoWrite 从传参到完成均不展示卡片。
+- 此过滤只隐藏包装调用的参数生成阶段；直接工具的流式预览、目标工具执行进度以及包装调用的失败/停止展示保持原行为。会话运行态和 Stop 入口仍读取原始投影。
 - `EnterPlanMode` 是会话模式切换的内部边界，不向用户提供可操作详情；主会话流在 `inputStreaming` / `running` / 终态下都不渲染它的 tool row。
 - 可见性过滤只作用于 UI render unit：协议投影仍保留原始 `ToolCallRow`，运行态、冷恢复、模式切换和诊断轨迹不得因隐藏展示而丢失。
 - 过滤在桌面 `desktop-continuous` 和手机 `web-remote-replayable` 共用的渲染单元上执行，不改写两类 delivery 的快照、gap 恢复或消息顺序。
 - conversation work items 会把连续的非只读 Shell 派生为 `Execute` UI 分组；该父节点不是协议工具调用，展开后继续复用单条 `ExecuteToolCallBlock`。PermissionDialog 不经过该聚合路径，仍按真实 tool call 单独审批和展示。
+
+## 收起详情的测量边界
+
+侧栏开关会改变会话宽度，虚拟列表可能重新挂载历史轮次。收起的工具详情仍保留 Radix 的 DOM、ARIA 和动画生命周期，但完全隐藏的节点不应写入测量样式或读取几何尺寸；可见、正在收起及 `forceMount` 内容继续按原流程测量。不得以移除首次展开动画、减少历史内容或改变展开记忆来换取性能。
+
+```text
+侧栏宽度变化 → timeline 测高与虚拟窗口更新 → 历史工具挂载
+  完全隐藏 → 保留折叠状态，跳过无效测量
+  展开 / 收起动画中 / forceMount → 原尺寸测量与 Presence 生命周期
+```
+
+影响层为 presentation，修正在 `@radix-ui/react-collapsible` 的尺寸测量边界；ESM 与 CommonJS 同步。工具、消息历史、项目分组和 Accordion 共用该依赖，需检查初始闭合、默认展开、鼠标/键盘切换、嵌套、快速反向切换和 `forceMount`。`ToolLayout` 仍持有工具展开记忆，Radix 持有动画 presence，`ConversationTimeline` 仍是滚动 owner。手机 Web 共用展示组件，协议、权限、工具执行和 continuous/replayable 传输不变，因此不扩展这些不受影响的组合。
+
+SPT05 验收以真实 DOM 几何调用和动画事件为证据：批量收起工具初次/再次挂载时隐藏节点的测量为零；展开与收起动画、详情内容、键盘和展开记忆保持；默认展开及 `forceMount` 的高度变量仍有效。桌面/手机、深浅主题与中英文共同验证。耗时记录用于前后比较，不使用机器相关绝对时长作为通过标准。时间线 resize 的跟随、离底及会话位置沿用 SRM10 回归。
 
 ## 扩展方式
 
@@ -37,13 +53,16 @@
 
 ## 专用 Tool Renderer
 
+- `ToolSearch` 按精确工具名使用搜索摘要卡，复用 WebSearch 的图标、运行状态和失败提示。卡片始终不可展开，不渲染参数、搜索结果、schema 或原始数据。
+- 摘要使用输入 `query`：`select:Read,TodoWrite` 展示为“搜索工具：Read, TodoWrite”，关键词查询保留原文；输入尚未到达或为空时只显示“搜索工具”。中英文共用同一渲染路径，长查询沿用搜索卡的单行省略。
+- 该分流仅属于 UI，不把 ToolSearch 加入通用 search family 或 Explore 聚合，不改变工具结果、模型请求及持久化。桌面实时与冷恢复、手机 Web 共用该 renderer。
 - `Node REPL` / Browser Use 工具的展开布局保持透明，并与工具摘要正文保持同一水平基线；不得在 `ToolLayout` 的详情间距之外再次叠加整块横向 padding。文本结果内容块和“查看执行细节”展开后的代码/错误栈分别使用 `bg-card border border-border rounded-xl`；图片、“查看执行细节”按钮和折叠布局本身留在卡片外。单行、非 JSON、长度不超过 160 字符的短结果使用普通次级正文展示；JSON、多行或更长的日志继续使用带复制/换行操作的 CodeBlock。图片结果在消息流展开区始终使用单列，避免窄桌面栏和手机 Web 中被响应式断点切成过窄的双列缩略图；大图查看器行为保持不变。
 - `CUA` 工具的展开区只展示面向用户的动作、结果、失败原因、建议、截图、权限、环境、列表和应用状态，不提供完整 tool call JSON 的“查看原始数据”入口。原始 input、output、display 和生命周期元数据仍按既有协议与持久化链路保留，只是不进入桌面端与手机 Web 共用的 CUA 展开界面；其他工具 renderer 的原始数据能力不受影响。
 - `ReadSessionContext` 通过 `ReadSessionContextToolCallBlock` 渲染，不走 fallback 的 `Parameters` / `Result` JSON 块。
 - 摘要行展示本次上下文读取的 `query`，并把 `sessionId` 作为次级标识。
 - 展开区只展示 `query` 和返回的上下文内容；若 output 是结构化对象，优先读取 `output.content`，再回退到文本型 output 或 `rawOutput`。
-- `SendMessage` 归入 `message` family，并通过 `SendMessageToolCallBlock` 渲染。收起态按“已发送/正在发送 + input `summary` + 给/to + 目标 agent `to`”组成一句完整摘要；展开态只展示目标智能体、摘要和消息正文，不展示投递状态、message/agent/task id、输出路径、result 或整段 tool call JSON。目标、摘要和消息都尚未到达时必须禁用展开，禁止在 streaming input 或字段未加载的 snapshot 上出现空详情面板。
-- `SendMessage` 的主展示数据使用 Core 在 model content 格式化和 hook additional context 拼接之外生成的 `local_agent_message` display payload。payload 只保留 `status`、失败 `error` 和结果 `message`，不得携带或展示 delivery、message/agent/task id、输出路径；`error` 与 `message` 必须分别受 4 KiB UTF-8 预算约束，超出时保留完整 code point 并追加 `...[truncated]` 标记，避免 display 绕过 tool result budget 放大实时事件和持久化快照。lowercase `send_message` 是另一条 session mailbox 语义，不得复用 `SendMessage` identity、display 或 renderer。
+- `SendMessage` 归入 `message` family，并通过 `SendMessageToolCallBlock` 渲染。收起态按“已发送/正在发送 + input `summary`（缺省时用 `message` 的第一个非空行） + 给/to + 目标 agent `to`”组成一句完整摘要；展开态只展示目标智能体、摘要和消息正文，不展示投递状态、message/agent/task id、输出路径、result 或整段 tool call JSON。目标、摘要和消息都尚未到达时必须禁用展开，禁止在 streaming input 或字段未加载的 snapshot 上出现空详情面板。
+- `SendMessage` 的主展示数据使用 Core 在 model content 格式化之外生成的 `local_agent_message` display payload（hook additional context 是单独的附件，不进 tool result）。payload 只保留 `status`、失败 `error` 和结果 `message`，不得携带或展示 delivery、message/agent/task id、输出路径；`error` 与 `message` 必须分别受 4 KiB UTF-8 预算约束，超出时保留完整 code point 并追加 `...[truncated]` 标记，避免 display 绕过 tool result budget 放大实时事件和持久化快照。lowercase `send_message` 是另一条 session mailbox 语义，不得复用 `SendMessage` identity、display 或 renderer。
 - `SendMessage` 的 display 若返回 `status: "failed"`，即使外层 tool call 已 completed，也按业务失败展示“消息发送失败”和 failure status；真实 tool failure 同样不得继续显示“已发送”。结构化 output、JSON 字符串、纯文本 model content 和 `rawOutput` / `result.content` 只作为旧快照/provider 兼容 fallback，禁止通过错误文案推断成功或失败。
 - `SendMessage` 的收起态必须显式覆盖完整终态：`completed` 显示“已发送”，`failed` 或 display 业务失败显示“消息发送失败”，`denied` 显示“发送已拒绝”，`stopped` 显示“发送已停止”；不得把非成功终态落入成功文案。
 - `TaskStop` 归入 `task-control` family，并通过 `TaskStopToolCallBlock` 渲染。收起态只使用停止中/已停止的动作文案和 `task_id`（输入阶段兼容 deprecated `shell_id`），不得展示 `task_type`；展开态的摘要行继续保留 task id，详情区只展示 task type、任务描述或命令，以及结果消息，不重复 task id，也不展示整段 tool call JSON。
@@ -100,3 +119,9 @@
 - V4 product projection 必须把 CUA、file diff 等通用 display 保留在 `ToolCallRow.output.display`；`ToolCallRow.display` 只保留既有 `node_repl_images` 专用通道。UI adapter 优先读取 `output.display`，并兼容旧 Node REPL 顶层 display。
 - CUA display v1 的 `input` 仅作为旧历史记录兼容字段继续可读；新事件不再重复写入。工具调用自身的 `ToolCallRow.input` 是唯一输入事实源，UI 解析旧 display 时丢弃其中的副本。
 - UI 读取 display 时必须同时覆盖桌面 `desktop-continuous` 的实时 raw event 与手机 `web-remote-replayable` 的持久化 metadata；不得把 replayable 恢复数据拼接进 desktop continuous 主链路，也不得绕过现有 snapshot/gap 恢复边界。
+
+## WebFetch 与公开工具展示
+
+WebFetch 独立归入 web-fetch family。摘要使用网页图标、Fetch/Fetching（中文：网页抓取/正在抓取）和目标 URL；不使用 prompt，不展开。明确历史 fetch/web_fetch/webfetch 别名兼容；不按 URL 输入猜分类。权限预览复用 WebFetch renderer；Explore 子项复用 URL 文本提取函数，再由探索分组渲染。
+
+App 与分享复用工具 renderer 注册表及分组 presentation。App 通过 capabilities 注入文件媒体、应用图标、模型 provider 名称和 agent 颜色；插件交互通过 render context 的 pluginUi 注入；公开展示仅注入资源 URL 与安全外链。纯展示层不能静态导入服务、平台、插件 runtime。Fetch 仍属于只读探索分组。

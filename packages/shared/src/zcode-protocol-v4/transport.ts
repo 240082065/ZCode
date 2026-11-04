@@ -1,4 +1,4 @@
-import { localTtftFactsSchema } from "../localTtft.js";
+import { localTtftFactsSchema } from "../local-ttft/contract.js";
 /* eslint-disable max-lines -- 三个 topic 的 logical/physical/candidate schema 必须共享同一通用传输声明，避免跨文件分叉。 */
 // 传输外壳：连接握手 / 订阅 / 帧信封。
 // 阶段为类型占位（后半接通道层时启用），数据形状已按规范定稿。
@@ -29,12 +29,21 @@ export const hostCapabilitiesSchema = z.object({
   // Wire-compatible：旧 Host 缺失等价于 false；调用方必须用 === true 判断。
   workspaceHookReview: z.boolean().optional(),
   independentPlanState: z.boolean().optional(),
+  genUiContext: z.boolean().optional(),
   /**
    * 本 Host 会发 `workflowRun.*` 键级增量（delta.ts 的两条 op），因而 `workflowRuns` 的
    * actors / nodes 可以到 1024 而不是旧界的 256。没有这个位的消费者收到的仍是整键
    * `state.updated`，并且先经 `clampWorkflowRunsForLegacy` 裁到旧界。
    */
   workflowRunDeltas: z.boolean().optional(),
+  historyFirst: z.boolean().optional(),
+  /**
+   * 本 Host 开启并转发 `v4/conversation/inputPrediction`。旧 Host 缺失等价于 false，
+   * 手机必须用 === true 判断，否则不发预测请求。
+   */
+  inputPrediction: z.boolean().optional(),
+  /** 本 Host 支持 rowsRange 的 `residency: "resident-only"`；缺失等价于 false，手机不得预加载。 */
+  residentRowsRange: z.boolean().optional(),
 });
 export type HostCapabilities = z.infer<typeof hostCapabilitiesSchema>;
 
@@ -82,6 +91,7 @@ export const clientHelloSchema = z
          * 是 `.strict()` 的，老 Host 见到不认识的键会整条 clientHello 解析失败、连接握不上手。
          */
         workflowRunDeltas: z.boolean().optional(),
+        historyFirst: z.boolean().optional(),
       })
       .strict()
       .optional(),
@@ -112,6 +122,8 @@ export const subscribeParamsSchema = z
     topic: z.string(),
     // 水位不变量：仅当客户端真持有该时刻一致状态才允许带。
     base: z.object({ logEpoch: z.string(), seq: z.number() }).optional(),
+    // 手动重试仅消费当前 failed attempt；普通重连不重跑 hook。
+    retryInitialization: z.string().min(1).optional(),
     // QoS hint，只影响调度，不影响语义。
     visibility: z.enum(["foreground", "background"]).optional(),
   })
@@ -142,6 +154,7 @@ export const conversationOpenTimingSchema = z
     cliRequestMs: openTimingMsSchema,
     cliBootstrapMs: openTimingMsSchema,
     cliSessionRestoreMs: openTimingMsSchema,
+    historyReadyMs: openTimingMsSchema,
     initialFrameEncodeMs: openTimingMsSchema,
     cliProcessState: z.enum(["spawned", "reused"]).optional(),
     sessionRuntimeState: z.enum(["cold", "warm"]).optional(),
@@ -335,14 +348,18 @@ export const V4_METHODS = {
   controllerResync: "v4/controller/resync",
   controllerUnsubscribe: "v4/controller/unsubscribe",
   conversationSubscribe: "v4/conversation/subscribe",
+  sessionsIndexReconcile: "v4/sessionsIndex/reconcile",
   conversationResync: "v4/conversation/resync",
   conversationUnsubscribe: "v4/conversation/unsubscribe",
   // 行分页 query（rows/range）：只读、无状态、超时重发安全。
   conversationRowsRange: "v4/conversation/rowsRange",
+  // 手机输入预测（input-prediction.ts）：只读查询；旧 CLI 不认识时手机静默无 hint。
+  conversationInputPrediction: "v4/conversation/inputPrediction",
   // 当前有效分支的终态 ExitPlanMode 目录；只读、无状态、超时重发安全。
   conversationPlans: "v4/conversation/plans",
   conversationFileChanges: "v4/conversation/fileChanges",
   backgroundBashOutput: "v4/conversation/backgroundBashOutput",
+  offPeakControl: "v4/conversation/offPeakControl",
   conversationFileRewindPreview: "v4/conversation/fileRewindPreview",
   // workflow run 的事件日志分页（详情页审计面）：只读、无状态、超时重发安全。
   // 新方法天然偏斜安全——旧桌面根本不会调用它。
@@ -365,6 +382,10 @@ export const V4_METHODS = {
   // 故收敛为 v4 query 而非 host 直连；旧词 usage/stats、session/usage 就此消费清零。
   usageStats: "v4/usage/stats",
   conversationUsage: "v4/conversation/usage",
+  // 项目数据彻底删除（schema 在 session-data.ts）：measure 只读；purge 幂等，已不存在的会话按 0 字节成功。
+  // 新方法偏斜安全：旧 CLI 返回 method-not-found，Host 据此不显示「删除数据」选项。
+  sessionDataMeasure: "v4/storage/sessionData/measure",
+  sessionDataPurge: "v4/storage/sessionData/purge",
   // 附件事务：禁止 full-data RPC。每个 chunk 的 decoded bytes <=512KiB，
   // renderer->host Channel 与 host->CLI NDJSON 都必须逐 request 证明 <=1MiB。
   attachmentBegin: "v4/attachment/begin",
@@ -405,6 +426,7 @@ export type V4ConnectionFlowParams = z.infer<typeof v4ConnectionFlowParamsSchema
 export const v4ConnectionFlowResultSchema = z.object({}).strict();
 
 export const V4_NOTIFICATIONS = {
+  offPeakLifecycle: "v4/offPeak/lifecycle",
   // 下行帧（snapshot / deltas），params = ConversationTopicFrame。
   conversationFrame: "v4/conversation/frame",
   // 仅 live ingest 的无正文事实；不进入 topic snapshot/recovery。
@@ -412,6 +434,7 @@ export const V4_NOTIFICATIONS = {
   localTtftFacts: "v4/telemetry/local-ttft",
   // 仅当前进程 live ToolCallResult 产生；历史与 replayable 链路不得补造。
   cuaPermissionObservation: "v4/cua/permission-observation",
+  pluginUiToolResult: "v4/plugin-ui/tool-result",
 } as const;
 
 /** 3.3.6 SSH 历史任务归属证明与 sessions-index 冷种子共享同一有界窗口。 */
@@ -420,6 +443,7 @@ export const MAX_LEGACY_TASK_IDS_PER_SUBSCRIBE = 200;
 // subscribe 请求 = 通用 SubscribeParams + connectionId（重订阅替换按
 // (connectionId, topic) 判定；stdio 单管道场景由 host 为每个下游客户端分配）。
 export const v4ConversationSubscribeParamsSchema = subscribeParamsSchema.extend({
+  additionalDirectories: z.array(z.string().trim().min(1)).max(256).optional(),
   connectionId: z.string(),
   clientMode: z.enum(["desktop-continuous", "web-remote-replayable"]),
   // 当前可信 attachment 的 workspace；cold resume 优先使用它恢复身份，live 不消费。
@@ -434,6 +458,7 @@ export const v4ConversationSubscribeParamsSchema = subscribeParamsSchema.extend(
    * 不是某一次订阅可以自选的口味。缺席 = 按旧消费者处理（整键 patch + 旧界裁剪）。
    */
   workflowRunDeltas: z.boolean().optional(),
+  historyFirst: z.boolean().optional(),
 });
 export type V4ConversationSubscribeParams = z.infer<typeof v4ConversationSubscribeParamsSchema>;
 
@@ -515,6 +540,11 @@ export const v4ConversationRowsRangeParamsSchema = z.object({
   // 取 rowId < beforeRowId 的行；缺省 = 从当前尾部向前。
   beforeRowId: z.number().optional(),
   limit: z.number().min(1).max(PROTOCOL_V4_LIMITS.rowsRangeMaxLimit),
+  /**
+   * 手机预加载只读热会话：会话不在内存就报 proto.sessionNotResident，不冷恢复、不重建投影；
+   * Host 同时只复用已运行的工作区 CLI，不为它拉起进程。缺省 = 现有行为（按需冷恢复）。
+   */
+  residency: z.literal("resident-only").optional(),
 });
 export type V4ConversationRowsRangeParams = z.infer<typeof v4ConversationRowsRangeParamsSchema>;
 

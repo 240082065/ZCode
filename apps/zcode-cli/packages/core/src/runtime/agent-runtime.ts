@@ -1,3 +1,4 @@
+import { configureOffPeakRuntime, controlOffPeakRuntime } from "./off-peak/runtime.js";
 import {
   createTurnAgentDefinitions,
   createAgentDefinitionsReader,
@@ -5,6 +6,7 @@ import {
 } from "../subagent/definitions.js";
 import { DEFAULT_ZCODE_MODEL_CONTEXT_BUDGET_STRATEGY, resolveExecutionState } from "@zcode/shared";
 import type { BackgroundBashOutputResult } from "@zcode/shared";
+import type { ModelRequestSessionFeature } from "@zcode/contracts";
 import {
   createDenyPermissionBroker,
   createRootTraceContext,
@@ -129,6 +131,8 @@ import type {
 } from "./types.js";
 import type { AgentRuntimeInternal } from "./internal.js";
 import { InMemoryRuntimeTaskRegistry, type RuntimeTaskRegistry } from "../runtime-task/registry.js";
+import type { WorkflowBlockedReminderClock } from "../runtime-task/workflow-blocked-reminder.js";
+import { createWorkflowBlockedReminder } from "./methods/dynamic-workflow-blocked-reminder.js";
 import { createMemoryRecallState } from "../memory/recall/index.js";
 import type { MemoryRecallState } from "../memory/recall/index.js";
 import type { ChildClientPortsContext, ClientFacingPorts } from "./helpers/child-client-ports.js";
@@ -143,6 +147,14 @@ import { cloneModelSelection } from "./model-selection.js";
 
 // oxlint-disable typescript-eslint/no-unsafe-declaration-merging
 export class AgentRuntime {
+  controlOffPeakExecution(
+    input: import("@zcode/shared").OffPeakControlParams,
+  ): Promise<import("@zcode/shared").OffPeakControlResult> {
+    return controlOffPeakRuntime(
+      this as unknown as import("./internal.js").AgentRuntimeInternal,
+      input,
+    );
+  }
   private sessionId: SessionId;
   private turnNumber: number;
   private config: AgentRuntimeConfig;
@@ -174,6 +186,9 @@ export class AgentRuntime {
   /** launch.md「On demand: activation」：onDemand 会话出生为 false，`activateDynamicWorkflowTools` 翻为 true。 */
   private dynamicWorkflowToolsActivated: boolean;
   private dynamicWorkflowActivationSource?: DynamicWorkflowActivationSource;
+  /** docs/design/v2/model/session-features-header.md：本会话用过的能力标签，出生为空。 */
+  private sessionFeatures = new Set<ModelRequestSessionFeature>();
+  private sessionFeaturesWrite: Promise<void> = Promise.resolve();
   private contextBuilder: ContextBuilder | null = null;
   private contextInitialized = false;
   private contextSourceSnapshot?: ContextSourceSnapshot;
@@ -190,6 +205,12 @@ export class AgentRuntime {
   private mcpPort?: McpPort;
   private mcpStartupPromise?: Promise<McpConnectionSnapshot>;
   private residencyBlockingWorkCount = 0;
+  private readonly residencyBlockingWork = new Set<Promise<unknown>>();
+  private ownedWorkClose?: Promise<void>;
+  private readonly shutdownController = new AbortController();
+  private resourceClose?: Promise<void>;
+  private retirement?: Promise<void>;
+  private readonly workChanged = new Set<() => void>();
   private mcpInitialized = false;
   private mcpToolsRegistered = false;
   private registeredMcpToolNames?: string[];
@@ -203,6 +224,8 @@ export class AgentRuntime {
   private dynamicWorkflowRunPort?: DynamicWorkflowRunPort;
   private modelCatalogPort?: ModelCatalogPort;
   private runtimeTaskRegistry: RuntimeTaskRegistry;
+  // 「run 还欠着决定、主代理闲着」的提醒钟；由命令队列的忙 / 闲沿驱动，beginShutdown 停掉。
+  private workflowBlockedReminder: WorkflowBlockedReminderClock;
   private branchGeneration = 0;
   private artifactStore?: ToolArtifactStorePort;
   private executionPort?: ExecutionPort;
@@ -226,7 +249,6 @@ export class AgentRuntime {
   };
   private currentTurnFileChanges: RuntimeTurnFileChangeMap = new Map();
   private lastAssistantCompletedAtMs?: number;
-  private lastEmittedLocalDate?: string;
   private autoCompactConsecutiveFailures = 0;
   private runtimeCommandQueue: RuntimeCommandQueue;
   private runtimeCommandDrainActive = false;
@@ -257,10 +279,10 @@ export class AgentRuntime {
     this.sessionId = sessionId;
     this.turnNumber = 0;
     // 3.12.2：兼容旧 Host/内部调用传入 legacy，但本版本 Runtime、日志和子 Agent 只使用 preflight。
-    this.config = projectPersistentAgentMemoryTools({
+    this.config = {
       ...config,
       modelContextBudgetStrategy: DEFAULT_ZCODE_MODEL_CONTEXT_BUDGET_STRATEGY,
-    });
+    };
     Object.assign(this.config, resolveExecutionState(config));
     const definitions = createTurnAgentDefinitions(
       deps.getAgentDefinitions ??
@@ -269,7 +291,10 @@ export class AgentRuntime {
         }),
       deps.loadAgentDefinitions,
     );
-    this.getAgentDefinitions = definitions.get;
+    // Host 每轮加载的快照会替代启动配置；在统一读取出口补齐 Memory 工具，
+    // 避免子 Agent 有持久记忆提示却没有 Write/Edit，也不回写原始配置。
+    this.getAgentDefinitions = () =>
+      projectPersistentAgentMemoryTools(definitions.get(), this.config.memory);
     this.prepareAgentDefinitions = definitions.prepare;
     this.agentTelemetry = new RuntimeTelemetryFacade({
       agentName: config.agentName,
@@ -307,6 +332,10 @@ export class AgentRuntime {
     this.providerRuntimeHeadersPort = deps.providerRuntimeHeadersPort;
     this.browserControlPort = deps.browserControlPort;
     this.modelRequestAdmission = deps.modelRequestAdmission;
+    configureOffPeakRuntime(
+      this as unknown as import("./internal.js").AgentRuntimeInternal,
+      deps.onOffPeakLifecycleEvent,
+    );
     // 旧会话的选择缺失不能阻断历史恢复；不在这里制造默认模型。
     this.sessionModelSelection =
       config.modelSelection && cloneModelSelection(config.modelSelection);
@@ -320,6 +349,7 @@ export class AgentRuntime {
     this.mcpPort = deps.mcpPort;
     this.runtimeTaskRegistry = deps.runtimeTaskRegistry ?? new InMemoryRuntimeTaskRegistry();
     this.runtimeTaskRegistry.setActiveBranchGeneration?.(this.branchGeneration);
+    this.workflowBlockedReminder = createWorkflowBlockedReminder(runtime);
     this.artifactStore = deps.artifactStore;
     this.executionPort = deps.executionPort;
     this.fileSystemPort = deps.fileSystemPort;
@@ -346,6 +376,79 @@ export class AgentRuntime {
     runtime.startMcpStartup(this.rootTraceContext);
   }
 
+  get shutdownSignal(): AbortSignal {
+    return this.shutdownController.signal;
+  }
+
+  /** child 不再接收执行，但既有后台工作可以自然结束；释放完成后 owner 才能移除引用。 */
+  retire(): Promise<void> {
+    this.beginShutdown();
+    this.retirement ??= (async () => {
+      await this.drainMemoryExtractions(null);
+      while (this.residencyBlockingWork.size > 0 || this.hasRunningBackgroundTasks()) {
+        // 先订阅再检查/等待，避免 ledger 或 task 恰好归零时丢掉唯一一次通知。
+        const changed = Promise.withResolvers<void>();
+        const notify = () => changed.resolve();
+        const unsubscribe = this.runtimeTaskRegistry.subscribe?.(notify);
+        this.workChanged.add(notify);
+        try {
+          if (this.residencyBlockingWork.size > 0 || this.hasRunningBackgroundTasks())
+            await changed.promise;
+        } finally {
+          unsubscribe?.();
+          this.workChanged.delete(notify);
+        }
+      }
+      await this.sessionFeaturesWrite;
+      await this.releaseRuntimeResources();
+    })();
+    return this.retirement;
+  }
+
+  /** 强制停止所属工作；与自然释放共用资源关闭 flight，失败只重试仍未释放的资源。 */
+  async close(): Promise<void> {
+    const work = await Promise.allSettled([this.closeOwnedWork()]);
+    const resources = await Promise.allSettled([this.releaseRuntimeResources()]);
+    const errors = [...work, ...resources].flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (errors.length) throw new AggregateError(errors, "Runtime cleanup failed");
+  }
+
+  private releaseRuntimeResources(): Promise<void> {
+    this.resourceClose ??= this.closeBrowserSession().catch((error) => {
+      this.resourceClose = undefined;
+      throw error;
+    });
+    return this.resourceClose;
+  }
+
+  closeOwnedWork(): Promise<void> {
+    this.beginShutdown();
+    this.stopActiveForegroundExecution({ reason: "session_closed" });
+    this.ownedWorkClose ??= (async () => {
+      const results = await Promise.allSettled([
+        this.subagentPort?.close?.(),
+        this.cancelRunningRuntimeBackgroundTasks({ reason: "session_closed" }),
+        this.drainMemoryExtractions(null),
+      ]);
+      // 既有 ledger 还包含 title、MCP startup、工具 part 和 turn 收尾；关闭不能只观察计数。
+      while (this.residencyBlockingWork.size > 0) {
+        await Promise.allSettled(this.residencyBlockingWork);
+      }
+      await this.sessionFeaturesWrite;
+      const errors = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (errors.length) throw new AggregateError(errors, "Session owned work cleanup failed");
+    })().catch((error) => {
+      // 子 owner 保留失败句柄；重试必须重新进入它，而不是永久返回旧 rejection。
+      this.ownedWorkClose = undefined;
+      throw error;
+    });
+    return this.ownedWorkClose;
+  }
+
   async closeBrowserSession(): Promise<void> {
     this.beginShutdown();
     disposeNodeReplSession(this.sessionId);
@@ -355,11 +458,12 @@ export class AgentRuntime {
         traceContext: this.rootTraceContext,
       });
     } catch (error) {
-      // browser backend 清理失败不能阻断 execution/MCP/session store 的主关闭链路。
+      // 上层并行关闭各资源；这里必须传播失败，防止生命周期把未释放的浏览器视为安全。
       this.logger?.warn("Browser session cleanup failed", {
         error: error instanceof Error ? error.message : String(error),
         event: "browser.session_cleanup.failed",
       });
+      throw error;
     }
   }
 
@@ -367,16 +471,23 @@ export class AgentRuntime {
     // ExecutionPort.close() 会把后台 Bash 收口为 cancelled；若允许
     // teardown terminal event 再唤醒模型，并与随后关闭的 session store 竞态。
     this.shuttingDown = true;
+    this.shutdownController.abort(new Error("Session runtime closed"));
+    // 同一条理由：会话在关，提醒钟不能再到点唤起一轮。
+    this.workflowBlockedReminder.stop();
     // 关闭单个 session 后进程仍存活，
     // 因此必须先终止该 runtime 的 Extraction，不能只在超时后放弃等待。
     this.memoryExtractionScheduler?.shutdown();
+    this.memoryRecallPrefetch?.abortController.abort();
   }
 }
 
 export interface AgentRuntime {
   lastPermissionGrantId?: string;
+  retire(): Promise<void>;
+  close(): Promise<void>;
   beginShutdown(): void;
   closeBrowserSession(): Promise<void>;
+  closeOwnedWork(): Promise<void>;
   updateConfig(
     patch: Pick<AgentRuntimeConfig, "mode" | "planEnabled" | "language" | "outputStyle">,
   ): void;
@@ -581,6 +692,14 @@ export interface AgentRuntime {
     source: DynamicWorkflowActivationSource;
     traceContext?: TraceContext;
   }): Promise<boolean>;
+  /**
+   * 记录本会话用过一项能力（docs/design/v2/model/session-features-header.md）。只增不减，
+   * 已有时 no-op 返回 false；此后的模型请求在 `x-zcode-session-features` 中带上它。
+   */
+  recordSessionFeature(input: {
+    feature: ModelRequestSessionFeature;
+    traceContext?: TraceContext;
+  }): boolean;
   trackResumedDynamicWorkflowRun(input: {
     runId: string;
     toolCallId?: string;
@@ -646,7 +765,7 @@ export interface AgentRuntime {
     options: RuntimeBackgroundStopOptions,
   ): Promise<RuntimeBackgroundStopResult>;
   cancelRunningRuntimeBackgroundTasks(input: {
-    reason: "subagent_cancelled";
+    reason: "subagent_cancelled" | "session_closed";
     traceContext?: TraceContext;
   }): Promise<void>;
   sealBackgroundTaskNotifications(input: {
