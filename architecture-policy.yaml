@@ -1488,3 +1488,7 @@ exceptions:
     paths:
       - packages/zcode-cua/src/**
     reason: The whole zcode-cua producer package (broker, native adapters, tools) entered the repo after the gate timestamp as pre-existing code moved from a separate repository; adopting its internal layers needs a dedicated CONTRACT pass (it has known internal cycles by design), not a mechanical split in this branch.
+  - id: script-bridge-fork-unmanaged-new-file
+    rule: unmanaged-new-file
+    paths: [packages/desktop/src/host/scriptBridge.ts]
+    reason: Fork-local loopback script bridge (devhub 67-487) started once from host/index.ts; it only wraps existing task services for local automation and adds no owner or module boundary. Adopting the whole desktop host is out of scope for the fork.
